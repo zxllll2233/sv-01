@@ -264,7 +264,8 @@ def main():
         analyzer.analyze_and_save_paired(
             sample_pairs, save_dir,
             baseline_type=args.baseline_type,
-            objective=args.objective
+            objective=args.objective,
+            base_path=args.eval_path
         )
         print(f"[Attribution] Done! Results saved to {save_dir}")
 

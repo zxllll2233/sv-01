@@ -263,7 +263,7 @@ class ECAPAAttributionAnalyzer:
         plt.close(fig)
 
     def analyze_and_save_paired(self, sample_pairs, save_dir, baseline_type='zero',
-                                objective='cosine_sim'):
+                                objective='cosine_sim', base_path=None):
         """
         批量配对归因分析
 
@@ -278,13 +278,14 @@ class ECAPAAttributionAnalyzer:
             save_dir: 保存目录
             baseline_type: 基线类型
             objective: 归因目标
+            base_path: 音频路径前缀，若提供则拼接到每个相对路径前
         """
         os.makedirs(save_dir, exist_ok=True)
 
         for i, pair in enumerate(sample_pairs):
-            target_path = pair['target']
-            ref_same_path = pair['ref_same']
-            ref_diff_path = pair['ref_diff']
+            target_path = os.path.join(base_path, pair['target']) if base_path else pair['target']
+            ref_same_path = os.path.join(base_path, pair['ref_same']) if base_path else pair['ref_same']
+            ref_diff_path = os.path.join(base_path, pair['ref_diff']) if base_path else pair['ref_diff']
             label = pair.get('label', f'sample_{i}')
 
             print(f"[Paired Attribution] Analyzing {label}...")
