@@ -1,5 +1,6 @@
 import argparse
 import os
+import gc
 import torch
 import random
 import glob
@@ -110,7 +111,7 @@ def main():
 
     # 模型路径参数 - 支持3个模型
     parser.add_argument('--initial_model_1', type=str,default="/home/zhangxl24/SpeakerRecongnition/voiceprint/Baseline_clean_noSpec/exp/vox1/model/model_0061.model", help='Path to model 1')
-    parser.add_argument('--initial_model_2', type=str, default="/home/zhangxl24/SpeakerRecongnition/voiceprint/Baseline_noise_Spec/exp/vox1/model/model_0075.model", help='Path to model 2')
+    parser.add_argument('--initial_model_2', type=str, default="/home/zhangxl24/SpeakerRecongnition/voiceprint/Baseline_noise_Spec/exp/vox1/model512/model_0089.model", help='Path to model 2')
     parser.add_argument('--initial_model_3', type=str, default="/home/zhangxl24/SpeakerRecongnition/wode/Noise_adv_vox1/exps/3.05/model/model_0077.model", help='Path to model 3')
     # 其他路径参数
     parser.add_argument('--save_path',  type=str,   default="attribution_result", help='Path to save attribution results')
@@ -139,88 +140,26 @@ def main():
     # 确保保存目录存在
     os.makedirs(args.save_path, exist_ok=True)
     
-    # 1. 加载三个模型
-    models_paths = [args.initial_model_1, args.initial_model_2, args.initial_model_3]
-    models_dict = {}
-    model_identifiers = [] # 用于构建保存目录
-    
-    for i, path in enumerate(models_paths):
-        print(f"[Attribution] Loading Model {i+1} from {path}...")
-        if not os.path.exists(path):
-            print(f"Error: Model file {path} not found.")
-            sys.exit(1)
-            
-        try:
-            # 实例化 ECAPAModel 并加载参数
-            model = ECAPAModel(**vars(args))
-            model.load_parameters(path)
-            model.eval()
-            
-            # 提取模型标识符 (倒数第五级目录)
-            try:
-                path_parts = os.path.normpath(path).split(os.sep)
-                epoch_str = os.path.splitext(os.path.basename(path))[0].split('_')[-1]
-                
-                if len(path_parts) >= 5:
-                    dir_name = path_parts[-5]
-                else:
-                    dir_name = path_parts[-2] if len(path_parts) >= 2 else f"Model_{i+1}"
-                
-                # 构建用于显示的名称 (Key)
-                # 如果名称已存在，追加后缀以防覆盖
-                key_name = dir_name
-                if key_name in models_dict:
-                     key_name = f"{dir_name}_{epoch_str}" # 尝试加 epoch
-                     if key_name in models_dict:
-                         key_name = f"{dir_name}_{i+1}" # 还是重复，加序号
-                
-                # 存入字典，key_name 将被用作图表的列标题
-                models_dict[key_name] = model.speaker_encoder
-                
-                # 保存标识符用于生成结果目录名
-                model_identifiers.append(f"{dir_name}_{epoch_str}")
-                
-            except Exception as e:
-                print(f"Error extracting name for model {path}: {e}")
-                models_dict[f"Model_{i+1}"] = model.speaker_encoder
-                model_identifiers.append(f"Model_{i+1}")
+    # 1. 收集模型路径（跳过空路径）
+    models_paths = [p for p in [args.initial_model_1, args.initial_model_2, args.initial_model_3] if p]
+    if not models_paths:
+        print("[Attribution] Error: No model paths provided.")
+        sys.exit(1)
 
-        except Exception as e:
-            print(f"Error loading model {path}: {e}")
-            sys.exit(1)
-
+    # 2. 预处理样本（在模型循环外只做一次）
     samples = []
     sample_pairs = []
 
     if args.mode == 'legacy':
-        # === Legacy Mode (original behavior) ===
         samples = get_samples(args)
         if not samples:
             print("[Attribution] Failed to get samples. Exiting.")
             return
-
-        analyzer = ECAPAAttributionAnalyzer(
-            models_dict=models_dict,
-            C=args.C,
-            device=args.device,
-            musan_path=args.musan_path
-        )
-
-        subdir_name = "_vs_".join(model_identifiers)
-        save_dir = os.path.join(args.save_path, subdir_name)
-        print(f"[Attribution] Results will be saved to: {save_dir}")
-
-        analyzer.analyze_and_save(samples, save_dir)
-        print(f"[Attribution] Done! Results saved to {save_dir}")
-
     elif args.mode == 'paired':
-        # === Paired Mode (positive/negative/difference attribution) ===
         if not args.paired_list or not os.path.exists(args.paired_list):
             print("[Attribution] Error: --paired_list is required for paired mode")
             return
-
         import csv
-        sample_pairs = []
         with open(args.paired_list, 'r') as f:
             reader = csv.reader(f)
             for row in reader:
@@ -231,47 +170,102 @@ def main():
                         'ref_diff': row[2],
                         'label': row[3] if len(row) >= 4 else f'pair_{len(sample_pairs)}'
                     }
-                    if os.path.exists(pair['target']) and os.path.exists(pair['ref_same']) and os.path.exists(pair['ref_diff']):
+                    target_full = os.path.join(args.eval_path, pair['target']) if args.eval_path else pair['target']
+                    same_full = os.path.join(args.eval_path, pair['ref_same']) if args.eval_path else pair['ref_same']
+                    diff_full = os.path.join(args.eval_path, pair['ref_diff']) if args.eval_path else pair['ref_diff']
+                    if os.path.exists(target_full) and os.path.exists(same_full) and os.path.exists(diff_full):
                         sample_pairs.append(pair)
                     else:
                         print(f"[Attribution] Warning: skipping pair with missing files: {pair['label']}")
-
         if not sample_pairs:
             print("[Attribution] No valid paired samples found. Exiting.")
             return
 
+    # 3. 逐模型循环：每次只加载一个模型，避免OOM
+    for i, model_path in enumerate(models_paths):
+        print(f"\n{'='*60}")
+        print(f"[Attribution] Model {i+1}/{len(models_paths)}: {model_path}")
+        print(f"{'='*60}")
+
+        if not os.path.exists(model_path):
+            print(f"Error: Model file {model_path} not found. Skipping.")
+            continue
+
+        try:
+            model = ECAPAModel(**vars(args))
+            model.load_parameters(model_path)
+            model.eval()
+        except Exception as e:
+            print(f"Error loading model {model_path}: {e}. Skipping.")
+            continue
+
+        # 提取模型标识符
+        try:
+            path_parts = os.path.normpath(model_path).split(os.sep)
+            epoch_str = os.path.splitext(os.path.basename(model_path))[0].split('_')[-1]
+            dir_name = path_parts[-5] if len(path_parts) >= 5 else (path_parts[-2] if len(path_parts) >= 2 else f"Model_{i+1}")
+            model_name = f"{dir_name}_{epoch_str}"
+        except Exception:
+            model_name = f"Model_{i+1}"
+
+        # 单模型字典
+        models_dict = {model_name: model.speaker_encoder}
+
+        analyzer = None
         baseline_computer = None
-        if args.baseline_type != 'zero':
-            first_model = list(models_dict.values())[0]
-            baseline_computer = BaselineComputer(
-                model=first_model,
-                target_length=200 * 160 + 240,
-                device=args.device
+        save_dir = os.path.join(args.save_path, model_name)
+
+        if args.mode == 'legacy':
+            print(f"[Attribution] Legacy mode, saving to: {save_dir}")
+
+            analyzer = ECAPAAttributionAnalyzer(
+                models_dict=models_dict,
+                C=args.C,
+                device=args.device,
+                musan_path=args.musan_path
+            )
+            analyzer.analyze_and_save(samples, save_dir)
+
+        elif args.mode == 'paired':
+            save_dir = os.path.join(args.save_path, f"paired_{model_name}")
+            print(f"[Attribution] Paired mode, saving to: {save_dir}")
+
+            if args.baseline_type != 'zero':
+                baseline_computer = BaselineComputer(
+                    model=model.speaker_encoder,
+                    target_length=200 * 160 + 240,
+                    device=args.device
+                )
+
+            analyzer = ECAPAAttributionAnalyzer(
+                models_dict=models_dict,
+                C=args.C,
+                device=args.device,
+                musan_path=args.musan_path,
+                baseline_computer=baseline_computer
+            )
+            analyzer.analyze_and_save_paired(
+                sample_pairs, save_dir,
+                baseline_type=args.baseline_type,
+                objective=args.objective,
+                base_path=args.eval_path
             )
 
-        analyzer = ECAPAAttributionAnalyzer(
-            models_dict=models_dict,
-            C=args.C,
-            device=args.device,
-            musan_path=args.musan_path,
-            baseline_computer=baseline_computer
-        )
+        print(f"[Attribution] Model {model_name} done! Saved to {save_dir}")
 
-        subdir_name = "_vs_".join(model_identifiers)
-        save_dir = os.path.join(args.save_path, f"paired_{subdir_name}")
-        print(f"[Attribution] Results will be saved to: {save_dir}")
+        del model, models_dict
+        if analyzer is not None:
+            del analyzer
+        if baseline_computer is not None:
+            del baseline_computer
+        gc.collect()
+        try:
+            torch.cuda.empty_cache()
+        except RuntimeError:
+            pass
+        print(f"[Attribution] GPU memory freed.")
 
-        analyzer.analyze_and_save_paired(
-            sample_pairs, save_dir,
-            baseline_type=args.baseline_type,
-            objective=args.objective,
-            base_path=args.eval_path
-        )
-        print(f"[Attribution] Done! Results saved to {save_dir}")
-
-    print("\n[Attribution] Selected audio files:")
-    for i, s in enumerate(samples if args.mode == 'legacy' else [p['target'] for p in sample_pairs]):
-        print(f"  {i+1}: {s}")
+    print(f"\n[Attribution] All {len(models_paths)} models completed.")
 
 if __name__ == "__main__":
     main()

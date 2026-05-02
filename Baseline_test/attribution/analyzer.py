@@ -151,6 +151,16 @@ class ECAPAAttributionAnalyzer:
             fbank = fbank - torch.mean(fbank, dim=-1, keepdim=True)
             fbank = fbank.squeeze().cpu().numpy()
 
+            ref_same_fbank = first_model.torchfbank(ref_same_tensor) + 1e-6
+            ref_same_fbank = ref_same_fbank.log()
+            ref_same_fbank = ref_same_fbank - torch.mean(ref_same_fbank, dim=-1, keepdim=True)
+            ref_same_fbank = ref_same_fbank.squeeze().cpu().numpy()
+
+            ref_diff_fbank = first_model.torchfbank(ref_diff_tensor) + 1e-6
+            ref_diff_fbank = ref_diff_fbank.log()
+            ref_diff_fbank = ref_diff_fbank - torch.mean(ref_diff_fbank, dim=-1, keepdim=True)
+            ref_diff_fbank = ref_diff_fbank.squeeze().cpu().numpy()
+
         if baseline_type != 'zero' and self.baseline_computer is not None:
             baseline = self.baseline_computer.get_baseline(
                 baseline_type, input_fbank_shape=[1, 80, fbank.shape[-1]]
@@ -192,72 +202,136 @@ class ECAPAAttributionAnalyzer:
             'positive': positive_results,
             'negative': negative_results,
             'difference': difference_results,
+            'fbank_target': fbank,
+            'fbank_ref_same': ref_same_fbank,
+            'fbank_ref_diff': ref_diff_fbank,
             'baseline_type': baseline_type
         }
 
-    def visualize_paired_attribution(self, paired_results, save_path,
-                                     audio_label="Target"):
+    def _plot_fbank_overlay(self, ax, fbank, ig, title, cmap_name='coolwarm',
+                            fbank_cmap='gray_r', fbank_alpha=0.5, ig_alpha_max=0.85):
         """
-        可视化配对归因结果：正例 / 反例 / 差值 三行 × (输入 + N模型) 列
+        在同一子图上绘制 FBank 背景 + IG 归因半透明叠加。
+        FBank 用灰度图显示原始频谱结构，IG 用颜色表示正负归因。
+        """
+        if ig.ndim == 3 and ig.shape[0] == 1:
+            ig = ig.squeeze(0)
 
-        Args:
-            paired_results: analyze_paired() 的返回结果
-            save_path: 保存路径
-            audio_label: 音频标签
+        T = fbank.shape[1]
+        F = fbank.shape[0]
+        extent = [0, T, 0, F]
+
+        # FBank 背景
+        ax.imshow(fbank, origin='lower', aspect='auto', cmap=fbank_cmap,
+                  alpha=fbank_alpha, extent=extent)
+
+        # IG overlay
+        limit = max(np.percentile(np.abs(ig), 99), 1e-8)
+        ig_norm = np.clip(ig / limit, -1, 1)
+        magnitude = np.abs(ig_norm)
+
+        cmap = plt.get_cmap(cmap_name)
+        if cmap_name == 'RdYlGn':
+            # 差值: 绿=正值(voiceprint), 直接映射
+            overlay = cmap((ig_norm + 1) / 2)
+        else:
+            overlay = cmap((ig_norm + 1) / 2)
+
+        # Alpha: 归因越强越不透明，弱归因透出背景 FBank
+        overlay[..., 3] = np.power(magnitude, 0.5) * ig_alpha_max
+
+        ax.imshow(overlay, origin='lower', aspect='auto', interpolation='bicubic',
+                  extent=extent)
+
+        ax.set_title(title, fontsize=9)
+        sm = plt.cm.ScalarMappable(cmap=cmap, norm=plt.Normalize(vmin=-limit, vmax=limit))
+        sm.set_array([])
+        self._add_colorbar(ax, sm, visible=True)
+
+        return limit
+
+    def visualize_paired_attribution(self, paired_results, save_path,
+                                     audio_label="Target", ref_same_label="Ref (Same)",
+                                     ref_diff_label="Ref (Diff)"):
+        """
+        可视化配对归因结果。
+
+        布局 (5行 × N模型列):
+          Row 0: Target FBank | Target FBank
+          Row 1: Ref Same FBank | Ref Same FBank
+          Row 2: Ref Diff FBank | Ref Diff FBank
+          Row 3: Positive overlay | Positive overlay
+          Row 4: Negative overlay | Negative overlay
+          Row 5: Difference overlay | Difference overlay
         """
         model_names = list(self.models.keys())
         num_models = len(model_names)
-        num_cols = num_models + 1
+        num_cols = num_models
 
-        fig, axes = plt.subplots(3, num_cols, figsize=(6 * num_cols, 12))
-        plt.rcParams.update({'font.size': 10})
+        fbank_target = paired_results['fbank_target']
+        fbank_ref_same = paired_results['fbank_ref_same']
+        fbank_ref_diff = paired_results['fbank_ref_diff']
 
-        groups = [
-            ('positive', 'Positive (Same Speaker)', 'coolwarm'),
-            ('negative', 'Negative (Diff Speaker)', 'coolwarm'),
-            ('difference', 'Difference (Voiceprint)', 'RdYlGn')
-        ]
+        n_rows = 6
+        row_h = 2.5
+        fig, axes = plt.subplots(n_rows, num_cols, figsize=(7 * num_cols, row_h * n_rows))
+        if num_cols == 1:
+            axes = axes.reshape(n_rows, 1)
+        plt.rcParams.update({'font.size': 9})
 
         first_model_name = model_names[0]
-        fbank = paired_results['positive'][first_model_name]['fbank']
+        T = fbank_target.shape[1]
+        F = fbank_target.shape[0]
+        extent = [0, T, 0, F]
 
-        for g_idx, (key, label, cmap_name) in enumerate(groups):
-            if g_idx == 0:
-                ax_fbank = axes[g_idx, 0]
-                im = ax_fbank.imshow(fbank, origin='lower', aspect='auto', cmap='jet',
-                                     extent=[0, fbank.shape[1], 0, fbank.shape[0]])
-                ax_fbank.set_ylabel("Mel Filter")
-                ax_fbank.set_title(f"FBank ({audio_label})")
-                self._add_colorbar(ax_fbank, im, visible=True)
-            else:
-                axes[g_idx, 0].axis('off')
+        for m_idx, name in enumerate(model_names):
+            ig_pos = paired_results['positive'][name]['ig']
+            ig_neg = paired_results['negative'][name]['ig']
+            ig_diff = paired_results['difference'][name]['ig_diff']
 
-            for m_idx, name in enumerate(model_names):
-                col_idx = m_idx + 1
-                ax = axes[g_idx, col_idx]
+            # Row 0: Target FBank
+            ax = axes[0, m_idx]
+            im = ax.imshow(fbank_target, origin='lower', aspect='auto', cmap='jet', extent=extent)
+            ax.set_ylabel("Mel Filter")
+            title = f"Target FBank\n{audio_label}" if m_idx == 0 else f"Target FBank\n{audio_label}"
+            ax.set_title(title, fontsize=9)
+            self._add_colorbar(ax, im, visible=True)
 
-                if key == 'difference':
-                    ig = paired_results[key][name]['ig_diff']
-                else:
-                    ig = paired_results[key][name]['ig']
+            # Row 1: Ref Same FBank
+            ax = axes[1, m_idx]
+            im = ax.imshow(fbank_ref_same, origin='lower', aspect='auto', cmap='jet', extent=extent)
+            ax.set_ylabel("Mel Filter")
+            ax.set_title(f"Ref Same FBank\n{ref_same_label}", fontsize=9)
+            self._add_colorbar(ax, im, visible=True)
 
-                if ig.ndim == 3 and ig.shape[0] == 1:
-                    ig = ig.squeeze(0)
+            # Row 2: Ref Diff FBank
+            ax = axes[2, m_idx]
+            im = ax.imshow(fbank_ref_diff, origin='lower', aspect='auto', cmap='jet', extent=extent)
+            ax.set_ylabel("Mel Filter")
+            ax.set_title(f"Ref Diff FBank\n{ref_diff_label}", fontsize=9)
+            self._add_colorbar(ax, im, visible=True)
 
-                limit = max(np.percentile(np.abs(ig), 99), 1e-8)
-                cmap = plt.get_cmap(cmap_name)
+            # Row 3: Positive overlay
+            ax = axes[3, m_idx]
+            self._plot_fbank_overlay(ax, fbank_target, ig_pos,
+                                     f"Positive (Same Spk)\n{name}", cmap_name='coolwarm')
+            ax.set_ylabel("Mel Filter")
 
-                im = ax.imshow(ig, origin='lower', aspect='auto', cmap=cmap,
-                               vmin=-limit, vmax=limit, interpolation='bicubic',
-                               extent=[0, fbank.shape[1], 0, fbank.shape[0]])
+            # Row 4: Negative overlay
+            ax = axes[4, m_idx]
+            self._plot_fbank_overlay(ax, fbank_target, ig_neg,
+                                     f"Negative (Diff Spk)\n{name}", cmap_name='coolwarm')
+            ax.set_ylabel("Mel Filter")
 
-                ax.set_title(f"{name}\n{label}")
-                if g_idx == 2:
-                    ax.set_xlabel("Time (Frames)")
-                self._add_colorbar(ax, im, visible=True)
+            # Row 5: Difference overlay
+            ax = axes[5, m_idx]
+            self._plot_fbank_overlay(ax, fbank_target, ig_diff,
+                                     f"Difference (Voiceprint)\n{name}", cmap_name='RdYlGn')
+            ax.set_ylabel("Mel Filter")
+            ax.set_xlabel("Time (Frames)")
 
         baseline_type = paired_results.get('baseline_type', 'zero')
-        fig.suptitle(f"Paired Attribution Analysis (Baseline: {baseline_type})", fontsize=14, y=1.01)
+        fig.suptitle(f"Paired Attribution (Baseline: {baseline_type})", fontsize=13, y=1.01)
         plt.tight_layout()
         plt.savefig(save_path, dpi=150, bbox_inches='tight')
         plt.close(fig)

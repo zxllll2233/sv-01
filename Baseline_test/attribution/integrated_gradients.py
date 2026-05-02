@@ -99,36 +99,41 @@ class IntegratedGradients_ECAPA:
                 # 归一化参考embedding并detach，梯度不流向参考
                 ref_embedding = F.normalize(ref_embedding, p=2, dim=1).detach()
 
-        # 4. 生成插值路径
+        # 4. 分批计算梯度（避免OOM：不一次性处理所有插值步骤）
         alphas = torch.linspace(0, 1, self.n_steps + 1, device=input_tensor.device)
-        alphas = alphas.view(-1, 1, 1, 1)  # [n_steps+1, 1, 1, 1]
+        delta = input_fbank - baseline  # [1, 80, T]
 
-        interpolated_inputs = baseline + alphas * (input_fbank - baseline)
-        interpolated_inputs.requires_grad_(True)
+        all_grads = []
+        batch_size = max(1, min(10, self.n_steps + 1))
 
-        # 5. 前向传播插值输入
-        outputs = self._forward_from_fbank(interpolated_inputs)  # [n_steps+1, 192]
+        for batch_start in range(0, self.n_steps + 1, batch_size):
+            batch_end = min(batch_start + batch_size, self.n_steps + 1)
+            batch_alphas = alphas[batch_start:batch_end].view(-1, 1, 1, 1)
+            batch_inputs = baseline + batch_alphas * delta
+            batch_inputs.requires_grad_(True)
 
-        # 6. 计算归因目标标量
-        if objective == 'cosine_sim':
-            assert ref_embedding is not None  # guaranteed by objective check above
-            # 归一化当前embedding
-            outputs_norm = F.normalize(outputs, p=2, dim=1)
-            # cosine similarity with detached reference
-            score = torch.sum(outputs_norm * ref_embedding, dim=1)  # [n_steps+1]
-        elif objective == 'l2_norm':
-            score = outputs.norm(p=2, dim=1)  # [n_steps+1]
-        else:
-            raise ValueError(f"Unknown objective: {objective}")
+            batch_outputs = self._forward_from_fbank(batch_inputs)
 
-        # 7. 反向传播求梯度
-        grads = torch.autograd.grad(
-            outputs=score,
-            inputs=interpolated_inputs,
-            grad_outputs=torch.ones_like(score),
-            create_graph=False,
-            retain_graph=False
-        )[0]  # [n_steps+1, 80, T]
+            if objective == 'cosine_sim':
+                assert ref_embedding is not None
+                batch_outputs_norm = F.normalize(batch_outputs, p=2, dim=1)
+                batch_score = torch.sum(batch_outputs_norm * ref_embedding, dim=1)
+            else:
+                batch_score = batch_outputs.norm(p=2, dim=1)
+
+            batch_grads = torch.autograd.grad(
+                outputs=batch_score,
+                inputs=batch_inputs,
+                grad_outputs=torch.ones_like(batch_score),
+                create_graph=False,
+                retain_graph=False
+            )[0]
+
+            all_grads.append(batch_grads.detach())
+            del batch_inputs, batch_outputs, batch_score, batch_grads
+
+        grads = torch.cat(all_grads, dim=0)  # [n_steps+1, 80, T]
+        del all_grads
 
         # 8. 梯形法则积分近似
         # (y_0 + 2*y_1 + ... + 2*y_{n-1} + y_n) / (2*n)
