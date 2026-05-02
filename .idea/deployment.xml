@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="PublishConfigData" autoUpload="Always" serverName="zhangxl24@202.201.244.10:50030 password" remoteFilesAllowedToDisappearOnAutoupload="false" confirmBeforeUploading="false">
+    <option name="confirmBeforeUploading" value="false" />
+    <serverData>
+      <paths name="aurora">
+        <serverdata>
+          <mappings>
+            <mapping deploy="/SpeakerRecongnition/voiceprint" local="$PROJECT_DIR$" web="/" />
+          </mappings>
+        </serverdata>
+      </paths>
+      <paths name="zhangxl24@202.201.244.10:50030 password">
+        <serverdata>
+          <mappings>
+            <mapping deploy="/home/zhangxl24/SpeakerRecongnition/voiceprint" local="$PROJECT_DIR$" />
+          </mappings>
+        </serverdata>
+      </paths>
+    </serverData>
+    <option name="myAutoUpload" value="ALWAYS" />
+  </component>
+</project>

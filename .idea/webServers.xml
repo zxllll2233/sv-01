@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="WebServers">
+    <option name="servers">
+      <webServer id="bcececd6-f595-4551-9f16-c1a33cb543a7" name="aurora">
+        <fileTransfer rootFolder="/home/zhangxl24" accessType="SFTP" host="202.201.244.10" port="50030" sshConfigId="bdbbc189-e300-49f5-8d89-1d5de32f9482" sshConfig="zhangxl24@202.201.244.10:50030 password">
+          <advancedOptions>
+            <advancedOptions dataProtectionLevel="Private" passiveMode="true" shareSSLContext="true" />
+          </advancedOptions>
+        </fileTransfer>
+      </webServer>
+    </option>
+  </component>
+</project>
