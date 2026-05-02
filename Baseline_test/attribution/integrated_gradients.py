@@ -104,7 +104,7 @@ class IntegratedGradients_ECAPA:
         delta = input_fbank - baseline  # [1, 80, T]
 
         all_grads = []
-        batch_size = max(1, min(10, self.n_steps + 1))
+        batch_size = max(1, min(5, self.n_steps + 1))
 
         for batch_start in range(0, self.n_steps + 1, batch_size):
             batch_end = min(batch_start + batch_size, self.n_steps + 1)

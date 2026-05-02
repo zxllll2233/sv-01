@@ -208,6 +208,34 @@ class ECAPAAttributionAnalyzer:
             'baseline_type': baseline_type
         }
 
+    # Mel bin → 语音学频段映射 (ECAPA-TDNN: n_mels=80, f_max=7600, f_min=20, sr=16000)
+    FREQ_BANDS = {
+        'F0\n(80-300Hz)': (0, 5),
+        'F1\n(300-1kHz)': (5, 17),
+        'F2\n(1k-2.5kHz)': (17, 35),
+        'F3\n(2.5k-4kHz)': (35, 52),
+        'High\n(4k-7.6kHz)': (52, 80),
+    }
+
+    def _add_freq_band_labels(self, ax):
+        """在 y 轴右侧标注语音学频段分区线"""
+        for band_name, (lo, hi) in self.FREQ_BANDS.items():
+            mid = (lo + hi) / 2
+            ax.axhline(y=hi, color='white', linewidth=0.5, alpha=0.6, linestyle='--')
+            ax.text(ax.get_xlim()[1] * 1.02, mid, band_name,
+                    fontsize=6, va='center', ha='left', color='#333333')
+
+    def _compute_band_energy(self, ig):
+        """计算各频段的归因能量占比"""
+        if ig.ndim == 3 and ig.shape[0] == 1:
+            ig = ig.squeeze(0)
+        total = np.abs(ig).sum() + 1e-10
+        energies = {}
+        for band_name, (lo, hi) in self.FREQ_BANDS.items():
+            short_name = band_name.split('\n')[0]
+            energies[short_name] = np.abs(ig[lo:hi, :]).sum() / total
+        return energies
+
     def _plot_fbank_overlay(self, ax, fbank, ig, title, cmap_name='coolwarm',
                             fbank_cmap='gray_r', fbank_alpha=0.5, ig_alpha_max=0.85):
         """
@@ -221,27 +249,21 @@ class ECAPAAttributionAnalyzer:
         F = fbank.shape[0]
         extent = [0, T, 0, F]
 
-        # FBank 背景
         ax.imshow(fbank, origin='lower', aspect='auto', cmap=fbank_cmap,
                   alpha=fbank_alpha, extent=extent)
 
-        # IG overlay
         limit = max(np.percentile(np.abs(ig), 99), 1e-8)
         ig_norm = np.clip(ig / limit, -1, 1)
         magnitude = np.abs(ig_norm)
 
         cmap = plt.get_cmap(cmap_name)
-        if cmap_name == 'RdYlGn':
-            # 差值: 绿=正值(voiceprint), 直接映射
-            overlay = cmap((ig_norm + 1) / 2)
-        else:
-            overlay = cmap((ig_norm + 1) / 2)
-
-        # Alpha: 归因越强越不透明，弱归因透出背景 FBank
+        overlay = cmap((ig_norm + 1) / 2)
         overlay[..., 3] = np.power(magnitude, 0.5) * ig_alpha_max
 
         ax.imshow(overlay, origin='lower', aspect='auto', interpolation='bicubic',
                   extent=extent)
+
+        self._add_freq_band_labels(ax)
 
         ax.set_title(title, fontsize=9)
         sm = plt.cm.ScalarMappable(cmap=cmap, norm=plt.Normalize(vmin=-limit, vmax=limit))
@@ -250,36 +272,109 @@ class ECAPAAttributionAnalyzer:
 
         return limit
 
+    def _plot_voiceprint_highlight(self, ax, fbank, ig_diff, title='',
+                                   threshold_percentile=70,
+                                   fbank_cmap='gray_r', fbank_alpha=0.6):
+        if ig_diff.ndim == 3 and ig_diff.shape[0] == 1:
+            ig_diff = ig_diff.squeeze(0)
+
+        T = fbank.shape[1]
+        F = fbank.shape[0]
+        extent = [0, T, 0, F]
+
+        ax.imshow(fbank, origin='lower', aspect='auto', cmap=fbank_cmap,
+                  alpha=fbank_alpha, extent=extent)
+
+        limit = max(np.percentile(np.abs(ig_diff), 99), 1e-8)
+        ig_norm = ig_diff / limit
+
+        pos_threshold = np.percentile(ig_norm[ig_norm > 0], max(0, 100 - threshold_percentile)) if (ig_norm > 0).any() else 0.5
+
+        rgba = np.zeros((*ig_norm.shape, 4))
+
+        pos_mask = ig_norm > pos_threshold
+        pos_strength = np.clip((ig_norm - pos_threshold) / (1 - pos_threshold + 1e-8), 0, 1)
+        rgba[pos_mask, 0] = 1.0
+        rgba[pos_mask, 1] = 0.1
+        rgba[pos_mask, 2] = 0.1
+        rgba[pos_mask, 3] = pos_strength[pos_mask] * 0.9
+
+        ax.imshow(rgba, origin='lower', aspect='auto', interpolation='bicubic', extent=extent)
+
+        self._add_freq_band_labels(ax)
+
+        from matplotlib.patches import Patch
+        legend_elements = [
+            Patch(facecolor='red', alpha=0.8, label='Voiceprint (+)')
+        ]
+        ax.legend(handles=legend_elements, loc='upper right', fontsize=6,
+                  framealpha=0.7, handlelength=1)
+
+        ax.set_title(title, fontsize=9)
+
+    def _plot_band_energy_bars(self, ax, ig_pos, ig_neg, ig_diff, title):
+        """
+        绘制频段归因能量柱状图：正例/反例/差值 并排对比。
+        """
+        pos_energy = self._compute_band_energy(ig_pos)
+        neg_energy = self._compute_band_energy(ig_neg)
+        diff_energy = self._compute_band_energy(ig_diff)
+
+        bands = list(pos_energy.keys())
+        x = np.arange(len(bands))
+        width = 0.25
+
+        bars_pos = ax.bar(x - width, [pos_energy[b] for b in bands], width,
+                          label='Positive', color='#4a90d9', alpha=0.8)
+        bars_neg = ax.bar(x, [neg_energy[b] for b in bands], width,
+                          label='Negative', color='#d94a4a', alpha=0.8)
+        bars_diff = ax.bar(x + width, [diff_energy[b] for b in bands], width,
+                           label='Diff (VP)', color='#4ad94a', alpha=0.8)
+
+        ax.set_xticks(x)
+        ax.set_xticklabels(bands, fontsize=7)
+        ax.set_ylabel('Energy Ratio', fontsize=8)
+        ax.set_title(title, fontsize=9)
+        ax.legend(fontsize=6, loc='upper right')
+        ax.set_ylim(0, max(max(pos_energy.values()), max(neg_energy.values())) * 1.2)
+
+        # 在差值柱上标注数值
+        for bar, b in zip(bars_diff, bands):
+            val = diff_energy[b]
+            ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.005,
+                    f'{val:.2f}', ha='center', va='bottom', fontsize=6, color='#333333')
+
     def visualize_paired_attribution(self, paired_results, save_path,
                                      audio_label="Target", ref_same_label="Ref (Same)",
                                      ref_diff_label="Ref (Diff)"):
         """
         可视化配对归因结果。
 
-        布局 (5行 × N模型列):
-          Row 0: Target FBank | Target FBank
-          Row 1: Ref Same FBank | Ref Same FBank
-          Row 2: Ref Diff FBank | Ref Diff FBank
-          Row 3: Positive overlay | Positive overlay
-          Row 4: Negative overlay | Negative overlay
-          Row 5: Difference overlay | Difference overlay
+        布局 (7行 × (N模型+1)列):
+          Row 0: Target FBank        | ...
+          Row 1: Ref Same FBank      | ...
+          Row 2: Ref Diff FBank      | ...
+          Row 3: Positive overlay    | ...
+          Row 4: Negative overlay    | ...
+          Row 5: Voiceprint highlight| ...
+          Row 6: Band energy bars    | ...
+        最右列: 频段能量柱状图 (仅1列，跨所有模型)
         """
         model_names = list(self.models.keys())
         num_models = len(model_names)
-        num_cols = num_models
 
         fbank_target = paired_results['fbank_target']
         fbank_ref_same = paired_results['fbank_ref_same']
         fbank_ref_diff = paired_results['fbank_ref_diff']
 
-        n_rows = 6
+        n_rows = 7
+        num_cols = num_models + 1  # 最后一列放频段能量柱状图
         row_h = 2.5
-        fig, axes = plt.subplots(n_rows, num_cols, figsize=(7 * num_cols, row_h * n_rows))
+        fig, axes = plt.subplots(n_rows, num_cols, figsize=(7.5 * num_cols, row_h * n_rows))
         if num_cols == 1:
             axes = axes.reshape(n_rows, 1)
         plt.rcParams.update({'font.size': 9})
 
-        first_model_name = model_names[0]
         T = fbank_target.shape[1]
         F = fbank_target.shape[0]
         extent = [0, T, 0, F]
@@ -293,8 +388,7 @@ class ECAPAAttributionAnalyzer:
             ax = axes[0, m_idx]
             im = ax.imshow(fbank_target, origin='lower', aspect='auto', cmap='jet', extent=extent)
             ax.set_ylabel("Mel Filter")
-            title = f"Target FBank\n{audio_label}" if m_idx == 0 else f"Target FBank\n{audio_label}"
-            ax.set_title(title, fontsize=9)
+            ax.set_title(f"Target FBank\n{audio_label}", fontsize=9)
             self._add_colorbar(ax, im, visible=True)
 
             # Row 1: Ref Same FBank
@@ -323,12 +417,48 @@ class ECAPAAttributionAnalyzer:
                                      f"Negative (Diff Spk)\n{name}", cmap_name='coolwarm')
             ax.set_ylabel("Mel Filter")
 
-            # Row 5: Difference overlay
+            # Row 5: Voiceprint highlight (差值归因专用可视化)
             ax = axes[5, m_idx]
-            self._plot_fbank_overlay(ax, fbank_target, ig_diff,
-                                     f"Difference (Voiceprint)\n{name}", cmap_name='RdYlGn')
+            self._plot_voiceprint_highlight(ax, fbank_target, ig_diff,
+                                            f"Voiceprint Map\n{name}")
             ax.set_ylabel("Mel Filter")
-            ax.set_xlabel("Time (Frames)")
+
+            # Row 6: Band energy bars
+            ax = axes[6, m_idx]
+            self._plot_band_energy_bars(ax, ig_pos, ig_neg, ig_diff,
+                                        f"Band Energy\n{name}")
+            if m_idx == 0:
+                ax.set_ylabel("Energy Ratio", fontsize=8)
+
+        # 最后一列：合并所有模型的频段能量对比
+        last_col = num_cols - 1
+        if num_models > 1:
+            for row in range(n_rows):
+                if row == 6:
+                    # 频段能量汇总：所有模型的差值归因
+                    ax = axes[6, last_col]
+                    bands = list(self.FREQ_BANDS.keys())
+                    band_short = [b.split('\n')[0] for b in bands]
+                    x = np.arange(len(band_short))
+                    width = 0.8 / num_models
+
+                    for mi, name in enumerate(model_names):
+                        ig_diff = paired_results['difference'][name]['ig_diff']
+                        diff_e = self._compute_band_energy(ig_diff)
+                        offset = (mi - (num_models - 1) / 2) * width
+                        bars = ax.bar(x + offset, [diff_e[b] for b in band_short], width,
+                                      label=name, alpha=0.8)
+
+                    ax.set_xticks(x)
+                    ax.set_xticklabels(band_short, fontsize=7)
+                    ax.set_ylabel('Diff Energy Ratio', fontsize=8)
+                    ax.set_title('Voiceprint Band\nAll Models', fontsize=9)
+                    ax.legend(fontsize=6, loc='upper right')
+                else:
+                    axes[row, last_col].axis('off')
+        else:
+            for row in range(n_rows):
+                axes[row, last_col].axis('off')
 
         baseline_type = paired_results.get('baseline_type', 'zero')
         fig.suptitle(f"Paired Attribution (Baseline: {baseline_type})", fontsize=13, y=1.01)
