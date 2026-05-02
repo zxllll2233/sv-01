@@ -384,25 +384,28 @@ class ECAPAAttributionAnalyzer:
             ig_neg = paired_results['negative'][name]['ig']
             ig_diff = paired_results['difference'][name]['ig_diff']
 
-            # Row 0: Target FBank
+            # Row 0: Target FBank (gray_r 与 overlay 行风格统一)
             ax = axes[0, m_idx]
-            im = ax.imshow(fbank_target, origin='lower', aspect='auto', cmap='jet', extent=extent)
+            im = ax.imshow(fbank_target, origin='lower', aspect='auto', cmap='gray_r', extent=extent)
             ax.set_ylabel("Mel Filter")
             ax.set_title(f"Target FBank\n{audio_label}", fontsize=9)
+            self._add_freq_band_labels(ax)
             self._add_colorbar(ax, im, visible=True)
 
             # Row 1: Ref Same FBank
             ax = axes[1, m_idx]
-            im = ax.imshow(fbank_ref_same, origin='lower', aspect='auto', cmap='jet', extent=extent)
+            im = ax.imshow(fbank_ref_same, origin='lower', aspect='auto', cmap='gray_r', extent=extent)
             ax.set_ylabel("Mel Filter")
             ax.set_title(f"Ref Same FBank\n{ref_same_label}", fontsize=9)
+            self._add_freq_band_labels(ax)
             self._add_colorbar(ax, im, visible=True)
 
             # Row 2: Ref Diff FBank
             ax = axes[2, m_idx]
-            im = ax.imshow(fbank_ref_diff, origin='lower', aspect='auto', cmap='jet', extent=extent)
+            im = ax.imshow(fbank_ref_diff, origin='lower', aspect='auto', cmap='gray_r', extent=extent)
             ax.set_ylabel("Mel Filter")
             ax.set_title(f"Ref Diff FBank\n{ref_diff_label}", fontsize=9)
+            self._add_freq_band_labels(ax)
             self._add_colorbar(ax, im, visible=True)
 
             # Row 3: Positive overlay
