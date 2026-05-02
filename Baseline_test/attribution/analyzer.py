@@ -14,15 +14,17 @@ import time
 from .integrated_gradients import IntegratedGradients_ECAPA
 
 class ECAPAAttributionAnalyzer:
-    def __init__(self, models_dict: Dict[str, torch.nn.Module], C=512, n_steps=50, device='cuda', musan_path=None):
+    def __init__(self, models_dict: Dict[str, torch.nn.Module], C=512, n_steps=50, device='cuda', musan_path=None, baseline_computer=None):
         """
         Args:
             models_dict: A dictionary mapping model names to model instances.
             musan_path: Path to MUSAN noise dataset for augmentation analysis.
+            baseline_computer: BaselineComputer实例（多基线支持）
         """
         self.models = models_dict
         self.device = device
         self.target_length = 200 * 160 + 240 # 32240 samples
+        self.baseline_computer = baseline_computer
         
         # Initialize IG for each model
         self.igs = {}
@@ -113,7 +115,7 @@ class ECAPAAttributionAnalyzer:
                 fbank = fbank.squeeze().cpu().numpy()
                 
             # IG
-            ig_map = ig_analyzer.generate(audio_tensor)
+            ig_map = ig_analyzer.generate(audio_tensor, objective='l2_norm', verify_convergence=False)
             
             model_results[name] = {
                 'fbank': fbank,
@@ -121,6 +123,192 @@ class ECAPAAttributionAnalyzer:
             }
         
         return model_results
+
+    def analyze_paired(self, audio_tensor, ref_same_tensor, ref_diff_tensor,
+                       baseline_type='zero', objective='cosine_sim'):
+        """
+        配对归因分析：正例（同说话人）+ 反例（不同说话人）+ 差值
+
+        Args:
+            audio_tensor: 目标音频 [1, samples]
+            ref_same_tensor: 同一说话人参考音频 [1, samples]
+            ref_diff_tensor: 不同说话人参考音频 [1, samples]
+            baseline_type: 'zero' | 'global_mean' | 'speaker_mean' | 'cross_speaker_mean'
+            objective: 归因目标 ('cosine_sim' 或 'l2_norm')
+
+        Returns:
+            {
+                'positive': {model_name: {'fbank': ..., 'ig': ...}},
+                'negative': {model_name: {'fbank': ..., 'ig': ...}},
+                'difference': {model_name: {'ig_diff': ...}},
+                'baseline_type': baseline_type
+            }
+        """
+        with torch.no_grad():
+            first_model = list(self.models.values())[0]
+            fbank = first_model.torchfbank(audio_tensor) + 1e-6
+            fbank = fbank.log()
+            fbank = fbank - torch.mean(fbank, dim=-1, keepdim=True)
+            fbank = fbank.squeeze().cpu().numpy()
+
+        if baseline_type != 'zero' and self.baseline_computer is not None:
+            baseline = self.baseline_computer.get_baseline(
+                baseline_type, input_fbank_shape=[1, 80, fbank.shape[-1]]
+            )
+        else:
+            baseline = None
+
+        positive_results = {}
+        negative_results = {}
+        difference_results = {}
+
+        for name, model in self.models.items():
+            model.eval()
+            ig_analyzer = self.igs[name]
+
+            ig_positive = ig_analyzer.generate(
+                audio_tensor,
+                ref_tensor=ref_same_tensor,
+                baseline=baseline,
+                objective=objective,
+                verify_convergence=True
+            )
+
+            ig_negative = ig_analyzer.generate(
+                audio_tensor,
+                ref_tensor=ref_diff_tensor,
+                baseline=baseline,
+                objective=objective,
+                verify_convergence=True
+            )
+
+            ig_diff = ig_positive - ig_negative
+
+            positive_results[name] = {'fbank': fbank, 'ig': ig_positive}
+            negative_results[name] = {'fbank': fbank, 'ig': ig_negative}
+            difference_results[name] = {'ig_diff': ig_diff}
+
+        return {
+            'positive': positive_results,
+            'negative': negative_results,
+            'difference': difference_results,
+            'baseline_type': baseline_type
+        }
+
+    def visualize_paired_attribution(self, paired_results, save_path,
+                                     audio_label="Target"):
+        """
+        可视化配对归因结果：正例 / 反例 / 差值 三行 × (输入 + N模型) 列
+
+        Args:
+            paired_results: analyze_paired() 的返回结果
+            save_path: 保存路径
+            audio_label: 音频标签
+        """
+        model_names = list(self.models.keys())
+        num_models = len(model_names)
+        num_cols = num_models + 1
+
+        fig, axes = plt.subplots(3, num_cols, figsize=(6 * num_cols, 12))
+        plt.rcParams.update({'font.size': 10})
+
+        groups = [
+            ('positive', 'Positive (Same Speaker)', 'coolwarm'),
+            ('negative', 'Negative (Diff Speaker)', 'coolwarm'),
+            ('difference', 'Difference (Voiceprint)', 'RdYlGn')
+        ]
+
+        first_model_name = model_names[0]
+        fbank = paired_results['positive'][first_model_name]['fbank']
+
+        for g_idx, (key, label, cmap_name) in enumerate(groups):
+            if g_idx == 0:
+                ax_fbank = axes[g_idx, 0]
+                im = ax_fbank.imshow(fbank, origin='lower', aspect='auto', cmap='jet',
+                                     extent=[0, fbank.shape[1], 0, fbank.shape[0]])
+                ax_fbank.set_ylabel("Mel Filter")
+                ax_fbank.set_title(f"FBank ({audio_label})")
+                self._add_colorbar(ax_fbank, im, visible=True)
+            else:
+                axes[g_idx, 0].axis('off')
+
+            for m_idx, name in enumerate(model_names):
+                col_idx = m_idx + 1
+                ax = axes[g_idx, col_idx]
+
+                if key == 'difference':
+                    ig = paired_results[key][name]['ig_diff']
+                else:
+                    ig = paired_results[key][name]['ig']
+
+                if ig.ndim == 3 and ig.shape[0] == 1:
+                    ig = ig.squeeze(0)
+
+                limit = max(np.percentile(np.abs(ig), 99), 1e-8)
+                cmap = plt.get_cmap(cmap_name)
+
+                im = ax.imshow(ig, origin='lower', aspect='auto', cmap=cmap,
+                               vmin=-limit, vmax=limit, interpolation='bicubic',
+                               extent=[0, fbank.shape[1], 0, fbank.shape[0]])
+
+                ax.set_title(f"{name}\n{label}")
+                if g_idx == 2:
+                    ax.set_xlabel("Time (Frames)")
+                self._add_colorbar(ax, im, visible=True)
+
+        baseline_type = paired_results.get('baseline_type', 'zero')
+        fig.suptitle(f"Paired Attribution Analysis (Baseline: {baseline_type})", fontsize=14, y=1.01)
+        plt.tight_layout()
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        plt.close(fig)
+
+    def analyze_and_save_paired(self, sample_pairs, save_dir, baseline_type='zero',
+                                objective='cosine_sim'):
+        """
+        批量配对归因分析
+
+        Args:
+            sample_pairs: 列表，每个元素为字典：
+                {
+                    'target': 'path/to/target.wav',
+                    'ref_same': 'path/to/same_speaker.wav',
+                    'ref_diff': 'path/to/diff_speaker.wav',
+                    'label': 'optional_label'
+                }
+            save_dir: 保存目录
+            baseline_type: 基线类型
+            objective: 归因目标
+        """
+        os.makedirs(save_dir, exist_ok=True)
+
+        for i, pair in enumerate(sample_pairs):
+            target_path = pair['target']
+            ref_same_path = pair['ref_same']
+            ref_diff_path = pair['ref_diff']
+            label = pair.get('label', f'sample_{i}')
+
+            print(f"[Paired Attribution] Analyzing {label}...")
+
+            try:
+                _, target_tensor = self._load_audio_as_tensor(target_path)
+                _, ref_same_tensor = self._load_audio_as_tensor(ref_same_path)
+                _, ref_diff_tensor = self._load_audio_as_tensor(ref_diff_path)
+
+                results = self.analyze_paired(
+                    target_tensor, ref_same_tensor, ref_diff_tensor,
+                    baseline_type=baseline_type, objective=objective
+                )
+
+                save_path = os.path.join(save_dir, f"{label}_paired_attribution.png")
+                self.visualize_paired_attribution(
+                    results, save_path, audio_label=os.path.basename(target_path)
+                )
+                print(f"[Paired Attribution] Saved: {save_path}")
+
+            except Exception as e:
+                print(f"[Paired Attribution] Error analyzing {label}: {str(e)}")
+                import traceback
+                traceback.print_exc()
 
     def analyze(self, audio_path: str) -> Dict:
         """Legacy method for single file analysis (Clean only)"""

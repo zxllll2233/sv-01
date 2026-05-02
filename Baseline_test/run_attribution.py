@@ -7,6 +7,7 @@ import sys
 from tools import *
 from ECAPAModel import ECAPAModel
 from attribution.analyzer import ECAPAAttributionAnalyzer
+from attribution.baseline import BaselineComputer
 
 def get_samples(args):
     """
@@ -120,6 +121,18 @@ def main():
     parser.add_argument('--musan_path', type=str, default="/home/database/noise/musan", help='The path to the MUSAN set')
     # 归因参数
     parser.add_argument('--attribution_samples', type=str, default="/home/database/sre/voxceleb/voxceleb1/test/wav/id10300/_WKW_Jkdvq8/00005.wav,/home/database/sre/voxceleb/voxceleb1/test/wav/id10270/GWXujl-xAVM/00004.wav,/home/database/sre/voxceleb/voxceleb1/test/wav/id10283/SwMoq9ZHxpw/00004.wav", help='Comma separated list of audio paths for attribution analysis')
+    # 归因模式参数
+    parser.add_argument('--mode', type=str, default='legacy',
+                        choices=['legacy', 'paired'],
+                        help='Attribution mode: legacy (original) or paired (positive/negative/difference)')
+    parser.add_argument('--paired_list', type=str, default=None,
+                        help='Path to paired sample list CSV file (for paired mode). Format: target_path,ref_same_path,ref_diff_path,label')
+    parser.add_argument('--baseline_type', type=str, default='zero',
+                        choices=['zero', 'global_mean', 'speaker_mean', 'cross_speaker_mean'],
+                        help='Baseline type for IG')
+    parser.add_argument('--objective', type=str, default='cosine_sim',
+                        choices=['cosine_sim', 'l2_norm'],
+                        help='Attribution objective function')
 
     args = parser.parse_args()
 
@@ -176,34 +189,87 @@ def main():
             print(f"Error loading model {path}: {e}")
             sys.exit(1)
 
-    # 2. 获取样本
-    samples = get_samples(args)
-    if not samples:
-        print("[Attribution] Failed to get samples. Exiting.")
-        return
+    samples = []
+    sample_pairs = []
 
-    # 3. 初始化分析器
-    print("[Attribution] Initializing analyzer...")
-    analyzer = ECAPAAttributionAnalyzer(
-        models_dict=models_dict,
-        C=args.C,
-        device=args.device,
-        musan_path=args.musan_path
-    )
-    
-    # 4. 构建保存目录名
-    # 使用之前提取的 model_identifiers (dir_name + epoch)
-    subdir_name = "_vs_".join(model_identifiers)
-    save_dir = os.path.join(args.save_path, subdir_name)
-    print(f"[Attribution] Results will be saved to: {save_dir}")
+    if args.mode == 'legacy':
+        # === Legacy Mode (original behavior) ===
+        samples = get_samples(args)
+        if not samples:
+            print("[Attribution] Failed to get samples. Exiting.")
+            return
 
-    # 5. 运行分析
-    print("[Attribution] Running attribution analysis...")
-    analyzer.analyze_and_save(samples, save_dir)
-    
-    print(f"[Attribution] Done! Results saved to {save_dir}")
+        analyzer = ECAPAAttributionAnalyzer(
+            models_dict=models_dict,
+            C=args.C,
+            device=args.device,
+            musan_path=args.musan_path
+        )
+
+        subdir_name = "_vs_".join(model_identifiers)
+        save_dir = os.path.join(args.save_path, subdir_name)
+        print(f"[Attribution] Results will be saved to: {save_dir}")
+
+        analyzer.analyze_and_save(samples, save_dir)
+        print(f"[Attribution] Done! Results saved to {save_dir}")
+
+    elif args.mode == 'paired':
+        # === Paired Mode (positive/negative/difference attribution) ===
+        if not args.paired_list or not os.path.exists(args.paired_list):
+            print("[Attribution] Error: --paired_list is required for paired mode")
+            return
+
+        import csv
+        sample_pairs = []
+        with open(args.paired_list, 'r') as f:
+            reader = csv.reader(f)
+            for row in reader:
+                if len(row) >= 3:
+                    pair = {
+                        'target': row[0],
+                        'ref_same': row[1],
+                        'ref_diff': row[2],
+                        'label': row[3] if len(row) >= 4 else f'pair_{len(sample_pairs)}'
+                    }
+                    if os.path.exists(pair['target']) and os.path.exists(pair['ref_same']) and os.path.exists(pair['ref_diff']):
+                        sample_pairs.append(pair)
+                    else:
+                        print(f"[Attribution] Warning: skipping pair with missing files: {pair['label']}")
+
+        if not sample_pairs:
+            print("[Attribution] No valid paired samples found. Exiting.")
+            return
+
+        baseline_computer = None
+        if args.baseline_type != 'zero':
+            first_model = list(models_dict.values())[0]
+            baseline_computer = BaselineComputer(
+                model=first_model,
+                target_length=200 * 160 + 240,
+                device=args.device
+            )
+
+        analyzer = ECAPAAttributionAnalyzer(
+            models_dict=models_dict,
+            C=args.C,
+            device=args.device,
+            musan_path=args.musan_path,
+            baseline_computer=baseline_computer
+        )
+
+        subdir_name = "_vs_".join(model_identifiers)
+        save_dir = os.path.join(args.save_path, f"paired_{subdir_name}")
+        print(f"[Attribution] Results will be saved to: {save_dir}")
+
+        analyzer.analyze_and_save_paired(
+            sample_pairs, save_dir,
+            baseline_type=args.baseline_type,
+            objective=args.objective
+        )
+        print(f"[Attribution] Done! Results saved to {save_dir}")
+
     print("\n[Attribution] Selected audio files:")
-    for i, s in enumerate(samples):
+    for i, s in enumerate(samples if args.mode == 'legacy' else [p['target'] for p in sample_pairs]):
         print(f"  {i+1}: {s}")
 
 if __name__ == "__main__":
