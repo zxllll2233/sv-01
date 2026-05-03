@@ -4,14 +4,21 @@ import random
 import torch
 import numpy as np
 import matplotlib
-matplotlib.use('Agg') # 非交互式后端
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
+from matplotlib.colors import LinearSegmentedColormap
 from mpl_toolkits.axes_grid1 import make_axes_locatable
 import soundfile as sf
 from typing import List, Dict, Union
 import time
 
 from .integrated_gradients import IntegratedGradients_ECAPA
+
+_PINK_BLUE_CMAP = LinearSegmentedColormap.from_list(
+    'pink_blue',
+    ['#0d1b2a', '#1b3a5c', '#3d7eaa', '#7fb8d8', '#c8dce8',
+     '#f0d0e0', '#e890b0', '#d06088', '#b03060', '#8a1040']
+)
 
 class ECAPAAttributionAnalyzer:
     def __init__(self, models_dict: Dict[str, torch.nn.Module], C=512, n_steps=50, device='cuda', musan_path=None, baseline_computer=None):
@@ -67,36 +74,28 @@ class ECAPAAttributionAnalyzer:
         noise_wav, _ = self._load_audio_as_tensor(noise_path)
         return noise_wav, noise_path
 
-    def _augment_audio(self, clean_wav, noise_wav, noise_path):
-        """
-        Mix clean and noise.
-        Returns: noisy_wav (numpy), noise_scaled (numpy)
-        """
-        # Identify noise category from path structure: .../musan/category/folder/file.wav
-        # Usually split by sep.
-        # dataLoader: file.split('/')[-3] -> category
-        try:
-            parts = noise_path.split(os.sep)
-            # finding 'musan' index might be safer, but let's assume standard structure
-            # If path is /.../musan/noise/free-sound/noise-001.wav
-            # category is 'noise' (index -3)
-            category = parts[-3]
-            if category not in self.noisesnr:
-                category = 'noise' # Default
-        except:
-            category = 'noise'
-            
+    def _augment_audio(self, clean_wav, noise_wav, noise_path, snr=None):
+        if snr is not None:
+            target_snr = snr
+        else:
+            try:
+                parts = noise_path.split(os.sep)
+                category = parts[-3]
+                if category not in self.noisesnr:
+                    category = 'noise'
+            except:
+                category = 'noise'
+            snr_range = self.noisesnr.get(category, [0, 15])
+            target_snr = random.uniform(snr_range[0], snr_range[1])
+
         clean_db = 10 * np.log10(np.mean(clean_wav ** 2) + 1e-4)
         noise_db = 10 * np.log10(np.mean(noise_wav ** 2) + 1e-4)
         
-        snr_range = self.noisesnr.get(category, [0, 15])
-        snr = random.uniform(snr_range[0], snr_range[1])
-        
-        scale = np.sqrt(10 ** ((clean_db - noise_db - snr) / 10))
+        scale = np.sqrt(10 ** ((clean_db - noise_db - target_snr) / 10))
         noise_scaled = scale * noise_wav
         noisy_wav = clean_wav + noise_scaled
         
-        return noisy_wav, noise_scaled, category
+        return noisy_wav, noise_scaled, target_snr
 
     def analyze_waveform(self, waveform: np.ndarray) -> Dict:
         """Analyze a specific waveform (numpy array)"""
@@ -125,7 +124,9 @@ class ECAPAAttributionAnalyzer:
         return model_results
 
     def analyze_paired(self, audio_tensor, ref_same_tensor, ref_diff_tensor,
-                       baseline_type='zero', objective='cosine_sim'):
+                       baseline_type='zero', objective='cosine_sim',
+                       speaker_audio_paths=None, all_audio_paths=None,
+                       exclude_speaker_paths=None):
         """
         配对归因分析：正例（同说话人）+ 反例（不同说话人）+ 差值
 
@@ -163,7 +164,10 @@ class ECAPAAttributionAnalyzer:
 
         if baseline_type != 'zero' and self.baseline_computer is not None:
             baseline = self.baseline_computer.get_baseline(
-                baseline_type, input_fbank_shape=[1, 80, fbank.shape[-1]]
+                baseline_type, input_fbank_shape=[1, 80, fbank.shape[-1]],
+                speaker_audio_paths=speaker_audio_paths,
+                all_audio_paths=all_audio_paths,
+                exclude_speaker_paths=exclude_speaker_paths
             )
         else:
             baseline = None
@@ -237,7 +241,9 @@ class ECAPAAttributionAnalyzer:
         return energies
 
     def _plot_fbank_overlay(self, ax, fbank, ig, title, cmap_name='coolwarm',
-                            fbank_cmap='gray_r', fbank_alpha=0.5, ig_alpha_max=0.85):
+                            fbank_cmap=None, fbank_alpha=0.5, ig_alpha_max=0.85):
+        if fbank_cmap is None:
+            fbank_cmap = _PINK_BLUE_CMAP
         """
         在同一子图上绘制 FBank 背景 + IG 归因半透明叠加。
         FBank 用灰度图显示原始频谱结构，IG 用颜色表示正负归因。
@@ -274,7 +280,9 @@ class ECAPAAttributionAnalyzer:
 
     def _plot_voiceprint_highlight(self, ax, fbank, ig_diff, title='',
                                    threshold_percentile=70,
-                                   fbank_cmap='gray_r', fbank_alpha=0.6):
+                                   fbank_cmap=None, fbank_alpha=0.6):
+        if fbank_cmap is None:
+            fbank_cmap = _PINK_BLUE_CMAP
         if ig_diff.ndim == 3 and ig_diff.shape[0] == 1:
             ig_diff = ig_diff.squeeze(0)
 
@@ -345,148 +353,140 @@ class ECAPAAttributionAnalyzer:
                     f'{val:.2f}', ha='center', va='bottom', fontsize=6, color='#333333')
 
     def visualize_paired_attribution(self, paired_results, save_path,
+                                     noisy_paired_results=None,
                                      audio_label="Target", ref_same_label="Ref (Same)",
-                                     ref_diff_label="Ref (Diff)"):
-        """
-        可视化配对归因结果。
-
-        布局 (7行 × (N模型+1)列):
-          Row 0: Target FBank        | ...
-          Row 1: Ref Same FBank      | ...
-          Row 2: Ref Diff FBank      | ...
-          Row 3: Positive overlay    | ...
-          Row 4: Negative overlay    | ...
-          Row 5: Voiceprint highlight| ...
-          Row 6: Band energy bars    | ...
-        最右列: 频段能量柱状图 (仅1列，跨所有模型)
-        """
+                                     ref_diff_label="Ref (Diff)",
+                                     noise_info=""):
         model_names = list(self.models.keys())
         num_models = len(model_names)
+        has_noisy = noisy_paired_results is not None
+
+        num_cols = max(num_models, 3)
+
+        if has_noisy:
+            n_rows = 5
+        else:
+            n_rows = 3
+
+        row_h = 3.0
+        fig, axes = plt.subplots(n_rows, num_cols,
+                                 figsize=(5 * num_cols, row_h * n_rows))
+        if n_rows == 1:
+            axes = axes.reshape(1, -1)
+        if num_cols == 1:
+            axes = axes.reshape(-1, 1)
+        plt.rcParams.update({'font.size': 9})
 
         fbank_target = paired_results['fbank_target']
         fbank_ref_same = paired_results['fbank_ref_same']
         fbank_ref_diff = paired_results['fbank_ref_diff']
-
-        n_rows = 7
-        num_cols = num_models + 1  # 最后一列放频段能量柱状图
-        row_h = 2.5
-        fig, axes = plt.subplots(n_rows, num_cols, figsize=(7.5 * num_cols, row_h * n_rows))
-        if num_cols == 1:
-            axes = axes.reshape(n_rows, 1)
-        plt.rcParams.update({'font.size': 9})
-
         T = fbank_target.shape[1]
         F = fbank_target.shape[0]
         extent = [0, T, 0, F]
+        fbank_cmap = _PINK_BLUE_CMAP
 
+        def _plot_fbank_row(ax, fbank, title):
+            im = ax.imshow(fbank, origin='lower', aspect='auto', cmap=fbank_cmap, extent=extent)
+            ax.set_title(title, fontsize=9)
+            self._add_freq_band_labels(ax)
+            self._add_colorbar(ax, im, visible=True)
+
+        # Row 0: Target FBank | Ref Same | Ref Diff
+        fbank_items = [
+            (fbank_target, f"Target FBank\n{audio_label}"),
+            (fbank_ref_same, f"Ref Same\n{ref_same_label}"),
+            (fbank_ref_diff, f"Ref Diff\n{ref_diff_label}"),
+        ]
+        for fi, (fb, title) in enumerate(fbank_items):
+            _plot_fbank_row(axes[0, fi], fb, title)
+        for fi in range(len(fbank_items), num_cols):
+            axes[0, fi].axis('off')
+
+        # Row 1: Voiceprint Map per model (clean)
         for m_idx, name in enumerate(model_names):
-            ig_pos = paired_results['positive'][name]['ig']
-            ig_neg = paired_results['negative'][name]['ig']
-            ig_diff = paired_results['difference'][name]['ig_diff']
-
-            # Row 0: Target FBank (gray_r 与 overlay 行风格统一)
-            ax = axes[0, m_idx]
-            im = ax.imshow(fbank_target, origin='lower', aspect='auto', cmap='gray_r', extent=extent)
-            ax.set_ylabel("Mel Filter")
-            ax.set_title(f"Target FBank\n{audio_label}", fontsize=9)
-            self._add_freq_band_labels(ax)
-            self._add_colorbar(ax, im, visible=True)
-
-            # Row 1: Ref Same FBank
             ax = axes[1, m_idx]
-            im = ax.imshow(fbank_ref_same, origin='lower', aspect='auto', cmap='gray_r', extent=extent)
-            ax.set_ylabel("Mel Filter")
-            ax.set_title(f"Ref Same FBank\n{ref_same_label}", fontsize=9)
-            self._add_freq_band_labels(ax)
-            self._add_colorbar(ax, im, visible=True)
-
-            # Row 2: Ref Diff FBank
-            ax = axes[2, m_idx]
-            im = ax.imshow(fbank_ref_diff, origin='lower', aspect='auto', cmap='gray_r', extent=extent)
-            ax.set_ylabel("Mel Filter")
-            ax.set_title(f"Ref Diff FBank\n{ref_diff_label}", fontsize=9)
-            self._add_freq_band_labels(ax)
-            self._add_colorbar(ax, im, visible=True)
-
-            # Row 3: Positive overlay
-            ax = axes[3, m_idx]
-            self._plot_fbank_overlay(ax, fbank_target, ig_pos,
-                                     f"Positive (Same Spk)\n{name}", cmap_name='coolwarm')
-            ax.set_ylabel("Mel Filter")
-
-            # Row 4: Negative overlay
-            ax = axes[4, m_idx]
-            self._plot_fbank_overlay(ax, fbank_target, ig_neg,
-                                     f"Negative (Diff Spk)\n{name}", cmap_name='coolwarm')
-            ax.set_ylabel("Mel Filter")
-
-            # Row 5: Voiceprint highlight (差值归因专用可视化)
-            ax = axes[5, m_idx]
+            ig_diff = paired_results['difference'][name]['ig_diff']
             self._plot_voiceprint_highlight(ax, fbank_target, ig_diff,
-                                            f"Voiceprint Map\n{name}")
-            ax.set_ylabel("Mel Filter")
+                                            f"Voiceprint (Clean)\n{name}",
+                                            fbank_cmap=fbank_cmap)
+        for m_idx in range(num_models, num_cols):
+            axes[1, m_idx].axis('off')
 
-            # Row 6: Band energy bars
-            ax = axes[6, m_idx]
-            self._plot_band_energy_bars(ax, ig_pos, ig_neg, ig_diff,
-                                        f"Band Energy\n{name}")
-            if m_idx == 0:
-                ax.set_ylabel("Energy Ratio", fontsize=8)
+        # Noisy block
+        if has_noisy:
+            noisy_target_fbank = noisy_paired_results['fbank_target']
 
-        # 最后一列：合并所有模型的频段能量对比
-        last_col = num_cols - 1
-        if num_models > 1:
-            for row in range(n_rows):
-                if row == 6:
-                    # 频段能量汇总：所有模型的差值归因
-                    ax = axes[6, last_col]
-                    bands = list(self.FREQ_BANDS.keys())
-                    band_short = [b.split('\n')[0] for b in bands]
-                    x = np.arange(len(band_short))
-                    width = 0.8 / num_models
+            # Row 2: Noisy Target FBank
+            _plot_fbank_row(axes[2, 0], noisy_target_fbank,
+                            f"Target FBank (Noisy)\n{noise_info}")
+            for fi in range(1, num_cols):
+                axes[2, fi].axis('off')
 
-                    for mi, name in enumerate(model_names):
-                        ig_diff = paired_results['difference'][name]['ig_diff']
-                        diff_e = self._compute_band_energy(ig_diff)
-                        offset = (mi - (num_models - 1) / 2) * width
-                        bars = ax.bar(x + offset, [diff_e[b] for b in band_short], width,
-                                      label=name, alpha=0.8)
+            # Row 3: Voiceprint Map per model (noisy)
+            for m_idx, name in enumerate(model_names):
+                ax = axes[3, m_idx]
+                ig_diff = noisy_paired_results['difference'][name]['ig_diff']
+                self._plot_voiceprint_highlight(ax, noisy_target_fbank, ig_diff,
+                                                f"Voiceprint (Noisy)\n{name}",
+                                                fbank_cmap=fbank_cmap)
+            for m_idx in range(num_models, num_cols):
+                axes[3, m_idx].axis('off')
 
-                    ax.set_xticks(x)
-                    ax.set_xticklabels(band_short, fontsize=7)
-                    ax.set_ylabel('Diff Energy Ratio', fontsize=8)
-                    ax.set_title('Voiceprint Band\nAll Models', fontsize=9)
-                    ax.legend(fontsize=6, loc='upper right')
-                else:
-                    axes[row, last_col].axis('off')
+        # Last row: Band Energy comparison
+        band_row = 4 if has_noisy else 2
+        ax_band = axes[band_row, 0]
+
+        bands = list(self.FREQ_BANDS.keys())
+        band_short = [b.split('\n')[0] for b in bands]
+        x = np.arange(len(band_short))
+
+        if has_noisy:
+            total_groups = num_models * 2
+            width = 0.8 / total_groups
+            idx = 0
+            for mi, name in enumerate(model_names):
+                diff_e_clean = self._compute_band_energy(
+                    paired_results['difference'][name]['ig_diff'])
+                offset = (idx - (total_groups - 1) / 2) * width
+                ax_band.bar(x + offset, [diff_e_clean[b] for b in band_short], width,
+                            label=f"{name} (Clean)", alpha=0.85)
+                idx += 1
+
+                diff_e_noisy = self._compute_band_energy(
+                    noisy_paired_results['difference'][name]['ig_diff'])
+                offset = (idx - (total_groups - 1) / 2) * width
+                ax_band.bar(x + offset, [diff_e_noisy[b] for b in band_short], width,
+                            label=f"{name} (Noisy)", alpha=0.65, hatch='//')
+                idx += 1
         else:
-            for row in range(n_rows):
-                axes[row, last_col].axis('off')
+            width = 0.8 / num_models
+            for mi, name in enumerate(model_names):
+                diff_e = self._compute_band_energy(
+                    paired_results['difference'][name]['ig_diff'])
+                offset = (mi - (num_models - 1) / 2) * width
+                ax_band.bar(x + offset, [diff_e[b] for b in band_short], width,
+                            label=name, alpha=0.85)
+
+        ax_band.set_xticks(x)
+        ax_band.set_xticklabels(band_short, fontsize=7)
+        ax_band.set_ylabel('VP Energy Ratio', fontsize=8)
+        ax_band.set_title('Voiceprint Band Energy', fontsize=9)
+        ax_band.legend(fontsize=6, loc='upper right')
+
+        for ci in range(1, num_cols):
+            axes[band_row, ci].axis('off')
 
         baseline_type = paired_results.get('baseline_type', 'zero')
-        fig.suptitle(f"Paired Attribution (Baseline: {baseline_type})", fontsize=13, y=1.01)
+        noise_suffix = f" | {noise_info}" if noise_info else ""
+        fig.suptitle(f"Voiceprint Attribution (Baseline: {baseline_type}{noise_suffix})",
+                     fontsize=13, y=1.01)
         plt.tight_layout()
         plt.savefig(save_path, dpi=150, bbox_inches='tight')
         plt.close(fig)
 
     def analyze_and_save_paired(self, sample_pairs, save_dir, baseline_type='zero',
-                                objective='cosine_sim', base_path=None):
-        """
-        批量配对归因分析
-
-        Args:
-            sample_pairs: 列表，每个元素为字典：
-                {
-                    'target': 'path/to/target.wav',
-                    'ref_same': 'path/to/same_speaker.wav',
-                    'ref_diff': 'path/to/diff_speaker.wav',
-                    'label': 'optional_label'
-                }
-            save_dir: 保存目录
-            baseline_type: 基线类型
-            objective: 归因目标
-            base_path: 音频路径前缀，若提供则拼接到每个相对路径前
-        """
+                                objective='cosine_sim', base_path=None,
+                                all_audio_paths=None, add_noise=False, snr=None):
         os.makedirs(save_dir, exist_ok=True)
 
         for i, pair in enumerate(sample_pairs):
@@ -498,18 +498,57 @@ class ECAPAAttributionAnalyzer:
             print(f"[Paired Attribution] Analyzing {label}...")
 
             try:
-                _, target_tensor = self._load_audio_as_tensor(target_path)
+                target_wav, target_tensor = self._load_audio_as_tensor(target_path)
                 _, ref_same_tensor = self._load_audio_as_tensor(ref_same_path)
                 _, ref_diff_tensor = self._load_audio_as_tensor(ref_diff_path)
 
-                results = self.analyze_paired(
+                speaker_audio_paths = None
+                exclude_speaker_paths = None
+                if baseline_type != 'zero' and all_audio_paths:
+                    target_dir = os.path.dirname(target_path)
+                    speaker_audio_paths = [
+                        p for p in all_audio_paths
+                        if os.path.dirname(p) == target_dir
+                    ]
+                    if baseline_type == 'cross_speaker_mean':
+                        exclude_speaker_paths = speaker_audio_paths
+
+                clean_results = self.analyze_paired(
                     target_tensor, ref_same_tensor, ref_diff_tensor,
-                    baseline_type=baseline_type, objective=objective
+                    baseline_type=baseline_type, objective=objective,
+                    speaker_audio_paths=speaker_audio_paths,
+                    all_audio_paths=all_audio_paths,
+                    exclude_speaker_paths=exclude_speaker_paths
                 )
+
+                noisy_results = None
+                noise_info = ""
+
+                if add_noise and self.noise_files:
+                    noise_wav, noise_path = self._get_noise_audio()
+                    if noise_wav is not None:
+                        noisy_wav, _, actual_snr = self._augment_audio(
+                            target_wav, noise_wav, noise_path, snr=snr
+                        )
+                        noisy_tensor = torch.FloatTensor(noisy_wav).unsqueeze(0).to(self.device)
+
+                        noisy_results = self.analyze_paired(
+                            noisy_tensor, ref_same_tensor, ref_diff_tensor,
+                            baseline_type=baseline_type, objective=objective,
+                            speaker_audio_paths=speaker_audio_paths,
+                            all_audio_paths=all_audio_paths,
+                            exclude_speaker_paths=exclude_speaker_paths
+                        )
+                        noise_info = f"{os.path.basename(noise_path)} (SNR={actual_snr:.1f}dB)"
+                    else:
+                        print("[Paired Attribution] Warning: no noise files available, skipping noisy analysis")
 
                 save_path = os.path.join(save_dir, f"{label}_paired_attribution.png")
                 self.visualize_paired_attribution(
-                    results, save_path, audio_label=os.path.basename(target_path)
+                    clean_results, save_path,
+                    noisy_paired_results=noisy_results,
+                    audio_label=os.path.basename(target_path),
+                    noise_info=noise_info
                 )
                 print(f"[Paired Attribution] Saved: {save_path}")
 

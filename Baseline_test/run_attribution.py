@@ -134,6 +134,10 @@ def main():
     parser.add_argument('--objective', type=str, default='cosine_sim',
                         choices=['cosine_sim', 'l2_norm'],
                         help='Attribution objective function')
+    parser.add_argument('--add_noise', action='store_true',
+                        help='Add noisy audio as right-side comparison block')
+    parser.add_argument('--snr', type=float, default=None,
+                        help='Fixed SNR (dB) for noise addition. If not set, random SNR from musan category ranges')
 
     args = parser.parse_args()
 
@@ -237,6 +241,9 @@ def main():
                     device=args.device
                 )
 
+            all_audio_paths = glob.glob(os.path.join(args.eval_path, "**/*.wav"), recursive=True)
+            print(f"[Attribution] Found {len(all_audio_paths)} audio files for baseline computation")
+
             analyzer = ECAPAAttributionAnalyzer(
                 models_dict=models_dict,
                 C=args.C,
@@ -248,7 +255,10 @@ def main():
                 sample_pairs, save_dir,
                 baseline_type=args.baseline_type,
                 objective=args.objective,
-                base_path=args.eval_path
+                base_path=args.eval_path,
+                all_audio_paths=all_audio_paths,
+                add_noise=args.add_noise,
+                snr=args.snr
             )
 
         print(f"[Attribution] Model {model_name} done! Saved to {save_dir}")
