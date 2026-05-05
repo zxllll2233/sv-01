@@ -18,12 +18,14 @@ Metrics:
 """
 
 import os
+import random
 import torch
 import torch.nn.functional as F
 import numpy as np
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
+from collections import defaultdict
 from typing import List, Dict, Tuple, Optional
 from tqdm import tqdm
 
@@ -254,7 +256,7 @@ def deletion_insertion_test(
                         'original_score_same', 'original_score_diff', 'ratios'
     """
     if ratios is None:
-        ratios = [0.05, 0.1, 0.15, 0.2, 0.3, 0.4, 0.5]
+        ratios = [0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
 
     model.eval()
 
@@ -369,7 +371,7 @@ def batch_deletion_insertion_test(
         dict with EER curves and AUC metrics
     """
     if ratios is None:
-        ratios = [0.05, 0.1, 0.15, 0.2, 0.3, 0.4, 0.5]
+        ratios = [0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
 
     model.eval()
     ig = IntegratedGradients_ECAPA(model, n_steps=n_steps)
@@ -510,6 +512,318 @@ def batch_deletion_insertion_test(
         'random_insertion_auc': random_insertion_auc,
         'all_scores': all_results,
     }
+
+
+# ──────────────────────────────────────────────
+#  Full-scale: eval_list based reliability test
+# ──────────────────────────────────────────────
+
+def batch_reliability_from_eval_list(
+    model,
+    eval_list_path: str,
+    eval_path: str,
+    n_targets: int = 50,
+    ratios: List[float] = None,
+    mode: str = 'freq_time',
+    n_random: int = 5,
+    n_steps: int = 50,
+    device: str = 'cuda',
+) -> Dict[str, Dict]:
+    """
+    Full-scale Deletion/Insertion test using VoxCeleb test list for EER computation.
+
+    Workflow:
+    1. Parse eval_list → get all (label, file1, file2) trial pairs
+    2. Sample n_targets unique target files (one per speaker for diversity)
+    3. For each target, find a same-speaker and diff-speaker reference (for IG attribution)
+    4. Pre-compute ALL reference embeddings (fast, just forward pass)
+    5. For each attribution method (cosine_sim_diff, l2_norm):
+       a. Compute IG attribution for each target (slow)
+       b. For each ratio, modify target FBank → re-compute embedding → score vs all refs
+       c. Compute EER at each ratio
+    6. Return results for both methods
+
+    Returns:
+        {
+            'cosine_sim_diff': {ratios, eer_curves, deletion_auc, insertion_auc, ...},
+            'l2_norm':         {ratios, eer_curves, deletion_auc, insertion_auc, ...},
+        }
+    """
+    if ratios is None:
+        ratios = [0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
+
+    model.eval()
+    ig = IntegratedGradients_ECAPA(model, n_steps=n_steps)
+    from tools import tuneThresholdfromScore
+
+    # ── 1. Parse eval list ──
+    trial_pairs = []
+    with open(eval_list_path) as f:
+        for line in f:
+            parts = line.strip().split()
+            if len(parts) >= 3:
+                trial_pairs.append((int(parts[0]), parts[1], parts[2]))
+    print(f"[Reliability] Loaded {len(trial_pairs)} trial pairs")
+
+    # ── 2. Sample targets (all files from n_targets speakers) ──
+    speaker_targets = defaultdict(set)
+    for _, f1, _ in trial_pairs:
+        spk = os.path.dirname(f1).split('/')[0]  # "id10270"
+        speaker_targets[spk].add(f1)
+
+    all_speakers = sorted(speaker_targets.keys())
+    if len(all_speakers) > n_targets:
+        sampled_speakers = random.sample(all_speakers, n_targets)
+    else:
+        sampled_speakers = all_speakers
+
+    # Use ALL target files from sampled speakers (not just 1 per speaker)
+    # This retains far more trial pairs → smoother EER curves
+    sampled_targets = set()
+    for spk in sampled_speakers:
+        sampled_targets.update(speaker_targets[spk])
+
+    print(f"[Reliability] Sampled {len(sampled_targets)} targets from {len(sampled_speakers)} speakers")
+
+    # ── 3. Filter relevant trial pairs ──
+    relevant_trials = [(l, f1, f2) for l, f1, f2 in trial_pairs if f1 in sampled_targets]
+    print(f"[Reliability] {len(relevant_trials)} relevant trial pairs for EER")
+
+    target_trials = defaultdict(list)
+    for label, f1, f2 in relevant_trials:
+        target_trials[f1].append((label, f2))
+
+    # ── 4. Find ref_same / ref_diff for each target (for attribution) ──
+    target_refs = {}
+    for target in sampled_targets:
+        same_refs = [f2 for l, f2 in target_trials.get(target, []) if l == 1]
+        diff_refs = [f2 for l, f2 in target_trials.get(target, []) if l == 0]
+        if same_refs and diff_refs:
+            target_refs[target] = {'same': same_refs[0], 'diff': diff_refs[0]}
+
+    valid_targets = sorted(target_refs.keys())
+    print(f"[Reliability] {len(valid_targets)} targets with both same/diff references")
+
+    # ── 5. Pre-compute ALL reference embeddings ──
+    all_ref_files = set()
+    for trials in target_trials.values():
+        for _, f2 in trials:
+            all_ref_files.add(f2)
+    for refs in target_refs.values():
+        all_ref_files.add(refs['same'])
+        all_ref_files.add(refs['diff'])
+    for t in valid_targets:
+        all_ref_files.add(t)
+
+    print(f"[Reliability] Pre-computing {len(all_ref_files)} embeddings...")
+    ref_embeddings = {}
+    for f in tqdm(sorted(all_ref_files), desc="Reference embeddings"):
+        full_path = os.path.join(eval_path, f)
+        try:
+            _, audio_tensor = load_audio_as_tensor(full_path, device)
+            with torch.no_grad():
+                fbank = model.torchfbank(audio_tensor) + 1e-6
+                fbank = fbank.log()
+                fbank = fbank - torch.mean(fbank, dim=-1, keepdim=True)
+                emb = _forward_from_fbank(model, fbank)
+                ref_embeddings[f] = F.normalize(emb, p=2, dim=1).cpu().detach()
+        except Exception as e:
+            print(f"  Warning: failed {f}: {e}")
+
+    # ── 6. Compute original EER ──
+    orig_scores, orig_labels = [], []
+    for target, trials in target_trials.items():
+        if target not in ref_embeddings:
+            continue
+        target_emb = ref_embeddings[target].to(device)
+        for label, ref_file in trials:
+            if ref_file not in ref_embeddings:
+                continue
+            ref_emb = ref_embeddings[ref_file].to(device)
+            score = torch.sum(target_emb * ref_emb, dim=1).item()
+            orig_scores.append(score)
+            orig_labels.append(label)
+
+    _, original_eer, _, _ = tuneThresholdfromScore(orig_scores, orig_labels, [1, 0.1])
+    print(f"[Reliability] Original EER: {original_eer:.2f}% ({len(orig_scores)} trials)")
+
+    # ── 7. Compute FBank for each target (reused across methods and ratios) ──
+    target_fbanks = {}
+    for target in tqdm(valid_targets, desc="Extracting target FBank"):
+        full_path = os.path.join(eval_path, target)
+        try:
+            _, audio_tensor = load_audio_as_tensor(full_path, device)
+            with torch.no_grad():
+                fbank = model.torchfbank(audio_tensor) + 1e-6
+                fbank = fbank.log()
+                fbank = fbank - torch.mean(fbank, dim=-1, keepdim=True)
+                target_fbanks[target] = fbank
+        except Exception as e:
+            print(f"  Warning: failed {target}: {e}")
+
+    # ── 8. For each attribution method ──
+    method_results = {}
+
+    for method in ['cosine_sim_diff', 'l2_norm']:
+        print(f"\n[Reliability] === {method} ===")
+
+        # 8a. Compute attribution for each target
+        target_attributions = {}
+        for target in tqdm(valid_targets, desc=f"IG ({method})"):
+            full_path = os.path.join(eval_path, target)
+            try:
+                _, target_tensor = load_audio_as_tensor(full_path, device)
+
+                if method == 'cosine_sim_diff':
+                    ref_same_path = os.path.join(eval_path, target_refs[target]['same'])
+                    ref_diff_path = os.path.join(eval_path, target_refs[target]['diff'])
+                    _, ref_same_tensor = load_audio_as_tensor(ref_same_path, device)
+                    _, ref_diff_tensor = load_audio_as_tensor(ref_diff_path, device)
+
+                    ig_pos = ig.generate(target_tensor, ref_tensor=ref_same_tensor,
+                                         objective='cosine_sim', verify_convergence=False)
+                    ig_neg = ig.generate(target_tensor, ref_tensor=ref_diff_tensor,
+                                         objective='cosine_sim', verify_convergence=False)
+                    target_attributions[target] = ig_pos - ig_neg
+                    del ref_same_tensor, ref_diff_tensor
+                else:
+                    attr = ig.generate(target_tensor, objective='l2_norm', verify_convergence=False)
+                    target_attributions[target] = attr
+
+                del target_tensor
+            except Exception as e:
+                print(f"  Warning: failed {target}: {e}")
+
+        # 8b. Deletion/Insertion at each ratio
+        deletion_eers = {}
+        insertion_eers = {}
+
+        for ratio in tqdm(ratios, desc=f"Deletion/Insertion ({method})"):
+            del_scores, del_labels = [], []
+            ins_scores, ins_labels = [], []
+
+            for target, trials in target_trials.items():
+                if target not in target_attributions or target not in target_fbanks:
+                    continue
+                attr = target_attributions[target]
+                fbank = target_fbanks[target]
+
+                # Deletion
+                modified_del = _apply_deletion(fbank, attr, ratio, mode=mode)
+                with torch.no_grad():
+                    emb_del = F.normalize(_forward_from_fbank(model, modified_del), p=2, dim=1)
+                for label, ref_file in trials:
+                    if ref_file not in ref_embeddings:
+                        continue
+                    ref_emb = ref_embeddings[ref_file].to(device)
+                    del_scores.append(torch.sum(emb_del * ref_emb, dim=1).item())
+                    del_labels.append(label)
+
+                # Insertion
+                modified_ins = _apply_insertion(fbank, attr, ratio, mode=mode)
+                with torch.no_grad():
+                    emb_ins = F.normalize(_forward_from_fbank(model, modified_ins), p=2, dim=1)
+                for label, ref_file in trials:
+                    if ref_file not in ref_embeddings:
+                        continue
+                    ref_emb = ref_embeddings[ref_file].to(device)
+                    ins_scores.append(torch.sum(emb_ins * ref_emb, dim=1).item())
+                    ins_labels.append(label)
+
+            try:
+                _, del_eer, _, _ = tuneThresholdfromScore(del_scores, del_labels, [1, 0.1])
+                deletion_eers[ratio] = del_eer
+            except Exception:
+                deletion_eers[ratio] = float('nan')
+
+            try:
+                _, ins_eer, _, _ = tuneThresholdfromScore(ins_scores, ins_labels, [1, 0.1])
+                insertion_eers[ratio] = ins_eer
+            except Exception:
+                insertion_eers[ratio] = float('nan')
+
+        # 8c. Random baseline
+        rng = np.random.default_rng(42)
+        random_deletion_eers = {}
+        random_insertion_eers = {}
+
+        for ratio in ratios:
+            run_del_eers = []
+            run_ins_eers = []
+            for _ in range(n_random):
+                rdel_scores, rdel_labels = [], []
+                rins_scores, rins_labels = [], []
+                for target, trials in target_trials.items():
+                    if target not in target_fbanks:
+                        continue
+                    fbank = target_fbanks[target]
+
+                    modified_del = _apply_random_deletion(fbank, ratio, rng=rng, mode=mode)
+                    with torch.no_grad():
+                        emb = F.normalize(_forward_from_fbank(model, modified_del), p=2, dim=1)
+                    for label, ref_file in trials:
+                        if ref_file not in ref_embeddings:
+                            continue
+                        rdel_scores.append(torch.sum(emb * ref_embeddings[ref_file].to(device), dim=1).item())
+                        rdel_labels.append(label)
+
+                    modified_ins = _apply_random_insertion(fbank, ratio, rng=rng, mode=mode)
+                    with torch.no_grad():
+                        emb = F.normalize(_forward_from_fbank(model, modified_ins), p=2, dim=1)
+                    for label, ref_file in trials:
+                        if ref_file not in ref_embeddings:
+                            continue
+                        rins_scores.append(torch.sum(emb * ref_embeddings[ref_file].to(device), dim=1).item())
+                        rins_labels.append(label)
+
+                try:
+                    _, eer, _, _ = tuneThresholdfromScore(rdel_scores, rdel_labels, [1, 0.1])
+                    run_del_eers.append(eer)
+                except Exception:
+                    pass
+                try:
+                    _, eer, _, _ = tuneThresholdfromScore(rins_scores, rins_labels, [1, 0.1])
+                    run_ins_eers.append(eer)
+                except Exception:
+                    pass
+
+            random_deletion_eers[ratio] = np.mean(run_del_eers) if run_del_eers else float('nan')
+            random_insertion_eers[ratio] = np.mean(run_ins_eers) if run_ins_eers else float('nan')
+
+        # 8d. Compute AUC
+        ratios_sorted = sorted(ratios)
+
+        def _compute_auc(rs, eer_vals, orig_eer):
+            if np.isnan(orig_eer) or orig_eer < 1e-6:
+                return float('nan')
+            norm = [eer_vals.get(r, float('nan')) / orig_eer for r in rs]
+            valid = [(r, e) for r, e in zip(rs, norm) if not np.isnan(e)]
+            if len(valid) < 2:
+                return float('nan')
+            r_vals, e_vals = zip(*valid)
+            return float(np.trapz(e_vals, r_vals))
+
+        method_results[method] = {
+            'ratios': ratios_sorted,
+            'eer_curves': {
+                'original': original_eer,
+                'deletion': deletion_eers,
+                'insertion': insertion_eers,
+                'random_deletion': random_deletion_eers,
+                'random_insertion': random_insertion_eers,
+            },
+            'deletion_auc': _compute_auc(ratios_sorted, deletion_eers, original_eer),
+            'insertion_auc': _compute_auc(ratios_sorted, insertion_eers, original_eer),
+            'random_deletion_auc': _compute_auc(ratios_sorted, random_deletion_eers, original_eer),
+            'random_insertion_auc': _compute_auc(ratios_sorted, random_insertion_eers, original_eer),
+        }
+
+        print(f"  Deletion AUC:  {method_results[method]['deletion_auc']:.4f} "
+              f"(random: {method_results[method]['random_deletion_auc']:.4f})")
+        print(f"  Insertion AUC: {method_results[method]['insertion_auc']:.4f} "
+              f"(random: {method_results[method]['random_insertion_auc']:.4f})")
+
+    return method_results
 
 
 # ──────────────────────────────────────────────
@@ -709,6 +1023,124 @@ def plot_method_comparison(cosine_results: Dict, l2_results: Dict, save_path: st
     fig.suptitle(f'Method Comparison: Ours (cos_sim_diff) vs L2-norm — {model_name}\n'
                  f'(mode={mode})',
                  fontsize=14, y=1.02)
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    plt.close(fig)
+
+
+def plot_combined_reliability(all_method_results: Dict[str, Dict], save_path: str,
+                              mode: str = 'freq_time'):
+    """
+    All models × all methods + cross-model comparison in a single figure.
+
+    Layout: (N_models + 1) rows × 2 columns
+      - Rows 1..N:  per-model cos_sim_diff vs l2_norm
+      - Last row:   cross-model comparison (cosine_sim_diff only)
+    """
+    model_names = sorted(all_method_results.keys())
+    n_rows = len(model_names) + 1
+    fig, axes = plt.subplots(n_rows, 2, figsize=(16, 5 * n_rows))
+
+    if n_rows == 1:
+        axes = axes[np.newaxis, :]
+
+    palette = ['#e74c3c', '#3498db', '#9b59b6', '#e67e22', '#1abc9c']
+
+    # ── Per-model rows: cos_sim_diff vs l2_norm ──
+    for row, model_name in enumerate(model_names):
+        method_results = all_method_results[model_name]
+        cos_r = method_results['cosine_sim_diff']
+        l2_r = method_results['l2_norm']
+        ratios = cos_r['ratios']
+        eer_cos = cos_r['eer_curves']
+        eer_l2 = l2_r['eer_curves']
+        original_eer = eer_cos['original']
+
+        cos_del = [eer_cos['deletion'].get(r, float('nan')) for r in ratios]
+        l2_del = [eer_l2['deletion'].get(r, float('nan')) for r in ratios]
+        rand_del = [eer_cos['random_deletion'].get(r, float('nan')) for r in ratios]
+
+        cos_ins = [eer_cos['insertion'].get(r, float('nan')) for r in ratios]
+        l2_ins = [eer_l2['insertion'].get(r, float('nan')) for r in ratios]
+        rand_ins = [eer_cos['random_insertion'].get(r, float('nan')) for r in ratios]
+
+        ax_del = axes[row, 0]
+        ax_ins = axes[row, 1]
+
+        ax_del.plot(ratios, cos_del, 'o-', color='#e74c3c', linewidth=2, markersize=5,
+                    label=f'Ours (AUC={cos_r["deletion_auc"]:.3f})')
+        ax_del.plot(ratios, l2_del, '^-', color='#3498db', linewidth=2, markersize=5,
+                    label=f'L2-norm (AUC={l2_r["deletion_auc"]:.3f})')
+        ax_del.plot(ratios, rand_del, 's--', color='#95a5a6', linewidth=1.5, markersize=4,
+                    label=f'Random (AUC={cos_r["random_deletion_auc"]:.3f})')
+        ax_del.axhline(y=original_eer, color='#2ecc71', linestyle=':', linewidth=1.5,
+                       label=f'Original EER ({original_eer:.2f}%)')
+        ax_del.set_xlabel('Deletion Ratio', fontsize=11)
+        ax_del.set_ylabel('EER (%)', fontsize=11)
+        ax_del.set_title(f'Deletion — {model_name}', fontsize=12)
+        ax_del.legend(fontsize=8)
+        ax_del.grid(True, alpha=0.3)
+
+        ax_ins.plot(ratios, cos_ins, 'o-', color='#e74c3c', linewidth=2, markersize=5,
+                    label=f'Ours (AUC={cos_r["insertion_auc"]:.3f})')
+        ax_ins.plot(ratios, l2_ins, '^-', color='#3498db', linewidth=2, markersize=5,
+                    label=f'L2-norm (AUC={l2_r["insertion_auc"]:.3f})')
+        ax_ins.plot(ratios, rand_ins, 's--', color='#95a5a6', linewidth=1.5, markersize=4,
+                    label=f'Random (AUC={cos_r["random_insertion_auc"]:.3f})')
+        ax_ins.axhline(y=original_eer, color='#2ecc71', linestyle=':', linewidth=1.5,
+                       label=f'Original EER ({original_eer:.2f}%)')
+        ax_ins.set_xlabel('Insertion Ratio', fontsize=11)
+        ax_ins.set_ylabel('EER (%)', fontsize=11)
+        ax_ins.set_title(f'Insertion — {model_name}', fontsize=12)
+        ax_ins.legend(fontsize=8)
+        ax_ins.grid(True, alpha=0.3)
+
+    # ── Last row: cross-model comparison (cosine_sim_diff) ──
+    last_row = n_rows - 1
+    ax_del = axes[last_row, 0]
+    ax_ins = axes[last_row, 1]
+
+    first_result = all_method_results[model_names[0]]['cosine_sim_diff']
+    ratios = first_result['ratios']
+    original_eer = first_result['eer_curves']['original']
+
+    for idx, model_name in enumerate(model_names):
+        cos_r = all_method_results[model_name]['cosine_sim_diff']
+        eer_cos = cos_r['eer_curves']
+        color = palette[idx % len(palette)]
+
+        ax_del.plot(ratios, [eer_cos['deletion'].get(r, float('nan')) for r in ratios],
+                    'o-', color=color, linewidth=2, markersize=5,
+                    label=f'{model_name} (AUC={cos_r["deletion_auc"]:.3f})')
+        ax_ins.plot(ratios, [eer_cos['insertion'].get(r, float('nan')) for r in ratios],
+                    'o-', color=color, linewidth=2, markersize=5,
+                    label=f'{model_name} (AUC={cos_r["insertion_auc"]:.3f})')
+
+    rand_del = [first_result['eer_curves']['random_deletion'].get(r, float('nan')) for r in ratios]
+    rand_ins = [first_result['eer_curves']['random_insertion'].get(r, float('nan')) for r in ratios]
+
+    ax_del.plot(ratios, rand_del, 's--', color='#95a5a6', linewidth=1.5, markersize=4,
+                label='Random baseline')
+    ax_del.axhline(y=original_eer, color='#2ecc71', linestyle=':', linewidth=1.5,
+                   label=f'Original EER ({original_eer:.2f}%)')
+    ax_del.set_xlabel('Deletion Ratio', fontsize=11)
+    ax_del.set_ylabel('EER (%)', fontsize=11)
+    ax_del.set_title('Deletion — Cross-Model Comparison (Ours)', fontsize=12)
+    ax_del.legend(fontsize=8)
+    ax_del.grid(True, alpha=0.3)
+
+    ax_ins.plot(ratios, rand_ins, 's--', color='#95a5a6', linewidth=1.5, markersize=4,
+                label='Random baseline')
+    ax_ins.axhline(y=original_eer, color='#2ecc71', linestyle=':', linewidth=1.5,
+                   label=f'Original EER ({original_eer:.2f}%)')
+    ax_ins.set_xlabel('Insertion Ratio', fontsize=11)
+    ax_ins.set_ylabel('EER (%)', fontsize=11)
+    ax_ins.set_title('Insertion — Cross-Model Comparison (Ours)', fontsize=12)
+    ax_ins.legend(fontsize=8)
+    ax_ins.grid(True, alpha=0.3)
+
+    fig.suptitle(f'Attribution Reliability: Deletion/Insertion Test (mode={mode})',
+                 fontsize=14, y=1.01)
     plt.tight_layout()
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
     plt.close(fig)

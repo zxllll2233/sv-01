@@ -112,7 +112,7 @@ def main():
 
     # 模型路径参数 - 支持3个模型
     parser.add_argument('--initial_model_1', type=str,default="/home/zhangxl24/SpeakerRecongnition/voiceprint/Baseline_clean_noSpec/exp/vox1/model/model_0061.model", help='Path to model 1')
-    parser.add_argument('--initial_model_2', type=str, default="/home/zhangxl24/SpeakerRecongnition/voiceprint/Baseline_noise_Spec/exp/vox1/model512/model_0089.model", help='Path to model 2')
+    parser.add_argument('--initial_model_2', type=str, default="/home/zhangxl24/SpeakerRecongnition/voiceprint/Baseline_noise_noSpec/vox1/clean/model/model_0078.model", help='Path to model 2')
     parser.add_argument('--initial_model_3', type=str, default="/home/zhangxl24/SpeakerRecongnition/wode/Noise_adv_vox1/exps/3.05/model/model_0077.model", help='Path to model 3')
     # 其他路径参数
     parser.add_argument('--save_path',  type=str,   default="attribution_result", help='Path to save attribution results')
@@ -140,13 +140,15 @@ def main():
     parser.add_argument('--snr', type=float, default=None,
                         help='Fixed SNR (dB) for noise addition. If not set, random SNR from musan category ranges')
     # Reliability test parameters
-    parser.add_argument('--del_ins_ratios', type=str, default='0.05,0.1,0.15,0.2,0.3,0.4,0.5',
+    parser.add_argument('--del_ins_ratios', type=str, default='0.05,0.1,0.15,0.2,0.25,0.3,0.35,0.4,0.5,0.6,0.7,0.8,0.9',
                         help='Comma-separated deletion/insertion ratios for reliability test')
     parser.add_argument('--del_ins_mode', type=str, default='freq_time',
                         choices=['freq_time', 'freq', 'time'],
                         help='Deletion/insertion mode: freq_time (per cell), freq (per frequency bin), time (per time frame)')
     parser.add_argument('--n_random', type=int, default=10,
                         help='Number of random baseline runs for reliability test')
+    parser.add_argument('--n_targets', type=int, default=50,
+                        help='Number of target speakers to sample for reliability test (eval_list mode)')
     parser.add_argument('--n_steps', type=int, default=50,
                         help='Number of IG integration steps')
 
@@ -170,10 +172,14 @@ def main():
         if not samples:
             print("[Attribution] Failed to get samples. Exiting.")
             return
-    elif args.mode in ('paired', 'reliability'):
+    elif args.mode == 'paired':
         if not args.paired_list or not os.path.exists(args.paired_list):
-            print(f"[Attribution] Error: --paired_list is required for {args.mode} mode")
+            print("[Attribution] Error: --paired_list is required for paired mode")
             return
+    elif args.mode == 'reliability':
+        pass  # paired_list is optional; if absent, eval_list will be used
+
+    if args.mode in ('paired', 'reliability') and args.paired_list and os.path.exists(args.paired_list):
         import csv
         with open(args.paired_list, 'r') as f:
             reader = csv.reader(f)
@@ -192,7 +198,7 @@ def main():
                         sample_pairs.append(pair)
                     else:
                         print(f"[Attribution] Warning: skipping pair with missing files: {pair['label']}")
-        if not sample_pairs:
+        if args.mode == 'paired' and not sample_pairs:
             print("[Attribution] No valid paired samples found. Exiting.")
             return
 
@@ -343,9 +349,8 @@ def main():
     if args.mode == 'reliability':
         from attribution.reliability import (
             batch_deletion_insertion_test,
-            plot_reliability_curves,
-            plot_multi_model_comparison,
-            plot_method_comparison,
+            batch_reliability_from_eval_list,
+            plot_combined_reliability,
         )
 
         paper_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'paper', 'result')
@@ -356,8 +361,8 @@ def main():
         ratios = [float(r) for r in args.del_ins_ratios.split(',')]
         del_ins_mode = args.del_ins_mode
 
-        all_cosine_results = {}
-        all_l2_results = {}
+        use_eval_list = args.paired_list is None or not os.path.exists(args.paired_list)
+        all_method_results = {}
 
         for mi, model_path in enumerate(models_paths):
             if not os.path.exists(model_path):
@@ -382,58 +387,52 @@ def main():
 
             print(f"\n[Reliability] Model {mi+1}/{len(models_paths)}: {model_name}")
 
-            print(f"  Running cosine_sim_diff attribution...")
-            cos_result = batch_deletion_insertion_test(
-                model=model.speaker_encoder,
-                sample_pairs=sample_pairs,
-                attribution_method='cosine_sim_diff',
-                ratios=ratios,
-                mode=del_ins_mode,
-                n_random=args.n_random,
-                n_steps=args.n_steps,
-                device=args.device,
-                eval_path=args.eval_path,
-            )
-            all_cosine_results[model_name] = cos_result
+            if use_eval_list:
+                method_results = batch_reliability_from_eval_list(
+                    model=model.speaker_encoder,
+                    eval_list_path=args.eval_list,
+                    eval_path=args.eval_path,
+                    n_targets=args.n_targets,
+                    ratios=ratios,
+                    mode=del_ins_mode,
+                    n_random=args.n_random,
+                    n_steps=args.n_steps,
+                    device=args.device,
+                )
+            else:
+                cos_result = batch_deletion_insertion_test(
+                    model=model.speaker_encoder,
+                    sample_pairs=sample_pairs,
+                    attribution_method='cosine_sim_diff',
+                    ratios=ratios,
+                    mode=del_ins_mode,
+                    n_random=args.n_random,
+                    n_steps=args.n_steps,
+                    device=args.device,
+                    eval_path=args.eval_path,
+                )
+                l2_result = batch_deletion_insertion_test(
+                    model=model.speaker_encoder,
+                    sample_pairs=sample_pairs,
+                    attribution_method='l2_norm',
+                    ratios=ratios,
+                    mode=del_ins_mode,
+                    n_random=args.n_random,
+                    n_steps=args.n_steps,
+                    device=args.device,
+                    eval_path=args.eval_path,
+                )
+                method_results = {
+                    'cosine_sim_diff': cos_result,
+                    'l2_norm': l2_result,
+                }
 
-            print(f"  Running l2_norm attribution...")
-            l2_result = batch_deletion_insertion_test(
-                model=model.speaker_encoder,
-                sample_pairs=sample_pairs,
-                attribution_method='l2_norm',
-                ratios=ratios,
-                mode=del_ins_mode,
-                n_random=args.n_random,
-                n_steps=args.n_steps,
-                device=args.device,
-                eval_path=args.eval_path,
-            )
-            all_l2_results[model_name] = l2_result
+            all_method_results[model_name] = method_results
 
-            plot_reliability_curves(
-                cos_result,
-                save_path=os.path.join(save_dir, f"{model_name}_cosine_sim_reliability.png"),
-                model_name=model_name,
-                attribution_method='cosine_sim_diff',
-                mode=del_ins_mode,
-            )
-            plot_reliability_curves(
-                l2_result,
-                save_path=os.path.join(save_dir, f"{model_name}_l2_norm_reliability.png"),
-                model_name=model_name,
-                attribution_method='l2_norm',
-                mode=del_ins_mode,
-            )
-            plot_method_comparison(
-                cos_result, l2_result,
-                save_path=os.path.join(save_dir, f"{model_name}_method_comparison.png"),
-                model_name=model_name,
-                mode=del_ins_mode,
-            )
-
-            print(f"  Deletion AUC:   cos_sim={cos_result['deletion_auc']:.4f}  l2={l2_result['deletion_auc']:.4f}")
-            print(f"  Insertion AUC:  cos_sim={cos_result['insertion_auc']:.4f}  l2={l2_result['insertion_auc']:.4f}")
-            print(f"  Random Del AUC: cos_sim={cos_result['random_deletion_auc']:.4f}  l2={l2_result['random_deletion_auc']:.4f}")
+            cos_r = method_results['cosine_sim_diff']
+            l2_r = method_results['l2_norm']
+            print(f"  Deletion AUC:   cos_sim={cos_r['deletion_auc']:.4f}  l2={l2_r['deletion_auc']:.4f}")
+            print(f"  Insertion AUC:  cos_sim={cos_r['insertion_auc']:.4f}  l2={l2_r['insertion_auc']:.4f}")
 
             del model
             gc.collect()
@@ -443,19 +442,11 @@ def main():
                 pass
             print(f"  [Model {mi+1}] done, GPU freed.")
 
-        if len(all_cosine_results) > 1:
-            plot_multi_model_comparison(
-                all_cosine_results,
-                save_path=os.path.join(save_dir, "multi_model_cosine_sim.png"),
-                attribution_method='cosine_sim_diff',
-                mode=del_ins_mode,
-            )
-            plot_multi_model_comparison(
-                all_l2_results,
-                save_path=os.path.join(save_dir, "multi_model_l2_norm.png"),
-                attribution_method='l2_norm',
-                mode=del_ins_mode,
-            )
+        plot_combined_reliability(
+            all_method_results,
+            save_path=os.path.join(save_dir, "reliability_combined.png"),
+            mode=del_ins_mode,
+        )
 
         print(f"\n[Reliability] All models completed. Results saved to: {save_dir}")
         return
