@@ -22,7 +22,7 @@ FREQ_BANDS = {
     'High\n(4k-7.6kHz)': (52, 80),
 }
 
-_TARGET_LENGTH = 200 * 160 + 240
+_TARGET_LENGTH = 300 * 160 + 240
 
 
 def load_audio_as_tensor(audio_path, device='cuda'):

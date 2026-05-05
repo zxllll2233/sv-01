@@ -625,8 +625,8 @@ def batch_reliability_from_eval_list(
                 fbank = model.torchfbank(audio_tensor) + 1e-6
                 fbank = fbank.log()
                 fbank = fbank - torch.mean(fbank, dim=-1, keepdim=True)
-                emb = _forward_from_fbank(model, fbank)
-                ref_embeddings[f] = F.normalize(emb, p=2, dim=1).cpu().detach()
+                emb = F.normalize(_forward_from_fbank(model, fbank), p=2, dim=1)
+                ref_embeddings[f] = emb.cpu().detach()
         except Exception as e:
             print(f"  Warning: failed {f}: {e}")
 

@@ -100,7 +100,7 @@ def main():
     parser = argparse.ArgumentParser(description = "ECAPA_attribution_comparison")
     
     # 必要参数 (与trainECAPAModel.py保持一致以便复用ECAPAModel初始化)
-    parser.add_argument('--num_frames', type=int,   default=200,     help='Duration of the input segments')
+    parser.add_argument('--num_frames', type=int,   default=300,     help='Duration of the input segments')
     parser.add_argument('--lr',         type=float, default=0.001,   help='Learning rate')
     parser.add_argument("--lr_decay",   type=float, default=0.97,    help='Learning rate decay')
     parser.add_argument('--C',       type=int,   default=512,   help='Channel size for the speaker encoder')
@@ -145,7 +145,7 @@ def main():
     parser.add_argument('--del_ins_mode', type=str, default='freq_time',
                         choices=['freq_time', 'freq', 'time'],
                         help='Deletion/insertion mode: freq_time (per cell), freq (per frequency bin), time (per time frame)')
-    parser.add_argument('--n_random', type=int, default=10,
+    parser.add_argument('--n_random', type=int, default=2,
                         help='Number of random baseline runs for reliability test')
     parser.add_argument('--n_targets', type=int, default=50,
                         help='Number of target speakers to sample for reliability test (eval_list mode)')
@@ -286,7 +286,7 @@ def main():
                 if args.baseline_type != 'zero':
                     baseline_computer = BaselineComputer(
                         model=model.speaker_encoder,
-                        target_length=200 * 160 + 240,
+                        target_length=300 * 160 + 240,
                         device=args.device
                     )
 
