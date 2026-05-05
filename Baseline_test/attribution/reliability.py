@@ -41,7 +41,7 @@ def _apply_deletion(fbank_tensor, attribution, ratio, mode='freq_time'):
 
     Args:
         fbank_tensor: [1, 80, T] FBank features (on device, with grad disabled)
-        attribution:  [80, T] attribution map (numpy)
+        attribution:  [80, T] or [1, 80, T] attribution map (numpy)
         ratio: fraction of features to delete [0, 1]
         mode: 'freq_time' — delete individual (freq, time) cells
               'freq'      — delete entire frequency bins (all time steps)
@@ -50,6 +50,8 @@ def _apply_deletion(fbank_tensor, attribution, ratio, mode='freq_time'):
     Returns:
         modified_fbank: [1, 80, T] tensor with top-ratio positions zeroed
     """
+    if attribution.ndim == 3 and attribution.shape[0] == 1:
+        attribution = attribution.squeeze(0)
     modified = fbank_tensor.clone()
     attr_flat = attribution.flatten()
 
@@ -84,6 +86,8 @@ def _apply_insertion(fbank_tensor, attribution, ratio, mode='freq_time'):
     Returns:
         modified_fbank: [1, 80, T] tensor with only top-ratio positions kept
     """
+    if attribution.ndim == 3 and attribution.shape[0] == 1:
+        attribution = attribution.squeeze(0)
     modified = torch.zeros_like(fbank_tensor)
     attr_flat = attribution.flatten()
 
