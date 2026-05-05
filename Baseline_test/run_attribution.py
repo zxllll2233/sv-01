@@ -200,7 +200,8 @@ def main():
     if args.mode == 'paired':
         from attribution.analyzer import load_audio_as_tensor, compute_fbank, visualize_attribution_6row
 
-        save_dir = os.path.join(args.save_path, "paired_all_models")
+        paper_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'paper', 'result')
+        save_dir = os.path.join(paper_dir, "paired_all_models")
         os.makedirs(save_dir, exist_ok=True)
         print(f"[Attribution] Paired mode, saving to: {save_dir}")
 
@@ -347,7 +348,8 @@ def main():
             plot_method_comparison,
         )
 
-        save_dir = os.path.join(args.save_path, "reliability_test")
+        paper_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'paper', 'result')
+        save_dir = os.path.join(paper_dir, "reliability_test")
         os.makedirs(save_dir, exist_ok=True)
         print(f"[Reliability] Saving to: {save_dir}")
 
