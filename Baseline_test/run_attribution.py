@@ -5,6 +5,7 @@ import torch
 import random
 import glob
 import sys
+import numpy as np
 from tools import *
 from ECAPAModel import ECAPAModel
 from attribution.analyzer import ECAPAAttributionAnalyzer
@@ -124,10 +125,10 @@ def main():
     parser.add_argument('--attribution_samples', type=str, default="/home/database/sre/voxceleb/voxceleb1/test/wav/id10300/_WKW_Jkdvq8/00005.wav,/home/database/sre/voxceleb/voxceleb1/test/wav/id10270/GWXujl-xAVM/00004.wav,/home/database/sre/voxceleb/voxceleb1/test/wav/id10283/SwMoq9ZHxpw/00004.wav", help='Comma separated list of audio paths for attribution analysis')
     # 归因模式参数
     parser.add_argument('--mode', type=str, default='legacy',
-                        choices=['legacy', 'paired'],
-                        help='Attribution mode: legacy (original) or paired (positive/negative/difference)')
+                        choices=['legacy', 'paired', 'reliability'],
+                        help='Attribution mode: legacy, paired, or reliability (deletion/insertion AUC test)')
     parser.add_argument('--paired_list', type=str, default=None,
-                        help='Path to paired sample list CSV file (for paired mode). Format: target_path,ref_same_path,ref_diff_path,label')
+                        help='Path to paired sample list CSV file (for paired/reliability mode). Format: target_path,ref_same_path,ref_diff_path,label')
     parser.add_argument('--baseline_type', type=str, default='zero',
                         choices=['zero', 'global_mean', 'speaker_mean', 'cross_speaker_mean'],
                         help='Baseline type for IG')
@@ -138,6 +139,16 @@ def main():
                         help='Add noisy audio as right-side comparison block')
     parser.add_argument('--snr', type=float, default=None,
                         help='Fixed SNR (dB) for noise addition. If not set, random SNR from musan category ranges')
+    # Reliability test parameters
+    parser.add_argument('--del_ins_ratios', type=str, default='0.05,0.1,0.15,0.2,0.3,0.4,0.5',
+                        help='Comma-separated deletion/insertion ratios for reliability test')
+    parser.add_argument('--del_ins_mode', type=str, default='freq_time',
+                        choices=['freq_time', 'freq', 'time'],
+                        help='Deletion/insertion mode: freq_time (per cell), freq (per frequency bin), time (per time frame)')
+    parser.add_argument('--n_random', type=int, default=10,
+                        help='Number of random baseline runs for reliability test')
+    parser.add_argument('--n_steps', type=int, default=50,
+                        help='Number of IG integration steps')
 
     args = parser.parse_args()
 
@@ -159,9 +170,9 @@ def main():
         if not samples:
             print("[Attribution] Failed to get samples. Exiting.")
             return
-    elif args.mode == 'paired':
+    elif args.mode in ('paired', 'reliability'):
         if not args.paired_list or not os.path.exists(args.paired_list):
-            print("[Attribution] Error: --paired_list is required for paired mode")
+            print(f"[Attribution] Error: --paired_list is required for {args.mode} mode")
             return
         import csv
         with open(args.paired_list, 'r') as f:
@@ -185,7 +196,269 @@ def main():
             print("[Attribution] No valid paired samples found. Exiting.")
             return
 
-    # 3. 逐模型循环：每次只加载一个模型，避免OOM
+    # 3. Paired mode: collect results across all models, visualize once
+    if args.mode == 'paired':
+        from attribution.analyzer import load_audio_as_tensor, compute_fbank, visualize_attribution_6row
+
+        save_dir = os.path.join(args.save_path, "paired_all_models")
+        os.makedirs(save_dir, exist_ok=True)
+        print(f"[Attribution] Paired mode, saving to: {save_dir}")
+
+        all_audio_paths = glob.glob(os.path.join(args.eval_path, "**/*.wav"), recursive=True)
+        print(f"[Attribution] Found {len(all_audio_paths)} audio files for baseline computation")
+
+        for i, pair in enumerate(sample_pairs):
+            target_path = os.path.join(args.eval_path, pair['target']) if args.eval_path else pair['target']
+            ref_same_path = os.path.join(args.eval_path, pair['ref_same']) if args.eval_path else pair['ref_same']
+            ref_diff_path = os.path.join(args.eval_path, pair['ref_diff']) if args.eval_path else pair['ref_diff']
+            label = pair.get('label', f'sample_{i}')
+
+            print(f"\n[Paired Attribution] Analyzing {label}...")
+
+            target_wav, target_tensor = load_audio_as_tensor(target_path, args.device)
+            _, ref_same_tensor = load_audio_as_tensor(ref_same_path, args.device)
+            _, ref_diff_tensor = load_audio_as_tensor(ref_diff_path, args.device)
+
+            noisy_tensor = None
+            noise_wav = None
+            noise_info = ""
+            if args.add_noise:
+                noise_files = glob.glob(os.path.join(args.musan_path, '*/*/*.wav')) if args.musan_path else []
+                if noise_files:
+                    noise_path = random.choice(noise_files)
+                    noise_wav, _ = load_audio_as_tensor(noise_path, args.device)
+                    clean_db = 10 * np.log10(np.mean(target_wav ** 2) + 1e-4)
+                    noise_db = 10 * np.log10(np.mean(noise_wav ** 2) + 1e-4)
+                    snr_val = args.snr if args.snr is not None else random.uniform(0, 15)
+                    scale = np.sqrt(10 ** ((clean_db - noise_db - snr_val) / 10))
+                    noisy_wav = target_wav + scale * noise_wav
+                    noisy_tensor = torch.FloatTensor(noisy_wav).unsqueeze(0).to(args.device)
+                    noise_info = f"{os.path.basename(noise_path)} (SNR={snr_val:.1f}dB)"
+
+            all_l2_attrs = {}
+            all_l2_noisy_attrs = {}
+            all_cos_clean_attrs = {}
+            all_cos_noisy_attrs = {}
+            fbank_clean = None
+            fbank_noise = None
+            fbank_noisy = None
+
+            for mi, model_path in enumerate(models_paths):
+                if not os.path.exists(model_path):
+                    print(f"Error: Model file {model_path} not found. Skipping.")
+                    continue
+
+                try:
+                    model = ECAPAModel(**vars(args))
+                    model.load_parameters(model_path)
+                    model.eval()
+                except Exception as e:
+                    print(f"Error loading model {model_path}: {e}. Skipping.")
+                    continue
+
+                try:
+                    path_parts = os.path.normpath(model_path).split(os.sep)
+                    epoch_str = os.path.splitext(os.path.basename(model_path))[0].split('_')[-1]
+                    dir_name = path_parts[-5] if len(path_parts) >= 5 else (path_parts[-2] if len(path_parts) >= 2 else f"Model_{mi+1}")
+                    model_name = f"{dir_name}_{epoch_str}"
+                except Exception:
+                    model_name = f"Model_{mi+1}"
+
+                print(f"  [Model {mi+1}/{len(models_paths)}] {model_name}")
+
+                if fbank_clean is None:
+                    fbank_clean = compute_fbank(model.speaker_encoder, target_tensor)
+                    fbank_noisy = compute_fbank(model.speaker_encoder, noisy_tensor) if noisy_tensor is not None else fbank_clean
+                    if noise_wav is not None:
+                        noise_tensor = torch.FloatTensor(noise_wav).unsqueeze(0).to(args.device)
+                        fbank_noise = compute_fbank(model.speaker_encoder, noise_tensor)
+                    else:
+                        fbank_noise = fbank_noisy
+
+                baseline_computer = None
+                if args.baseline_type != 'zero':
+                    baseline_computer = BaselineComputer(
+                        model=model.speaker_encoder,
+                        target_length=200 * 160 + 240,
+                        device=args.device
+                    )
+
+                speaker_audio_paths = None
+                exclude_speaker_paths = None
+                if args.baseline_type != 'zero' and all_audio_paths:
+                    target_dir = os.path.dirname(target_path)
+                    speaker_audio_paths = [p for p in all_audio_paths if os.path.dirname(p) == target_dir]
+                    if args.baseline_type == 'cross_speaker_mean':
+                        exclude_speaker_paths = speaker_audio_paths
+
+                models_dict = {model_name: model.speaker_encoder}
+                analyzer = ECAPAAttributionAnalyzer(
+                    models_dict=models_dict,
+                    C=args.C,
+                    device=args.device,
+                    musan_path=args.musan_path,
+                    baseline_computer=baseline_computer
+                )
+
+                attrs = analyzer.compute_model_attribution(
+                    target_tensor, ref_same_tensor, ref_diff_tensor,
+                    noisy_tensor=noisy_tensor,
+                    baseline_type=args.baseline_type,
+                    speaker_audio_paths=speaker_audio_paths,
+                    all_audio_paths=all_audio_paths,
+                    exclude_speaker_paths=exclude_speaker_paths
+                )
+
+                all_l2_attrs[model_name] = attrs[model_name]['l2_norm']
+                all_l2_noisy_attrs[model_name] = attrs[model_name].get('l2_norm_noisy', attrs[model_name]['l2_norm'])
+                all_cos_clean_attrs[model_name] = attrs[model_name]['cosine_sim_diff']
+                all_cos_noisy_attrs[model_name] = attrs[model_name].get('cosine_sim_noisy_diff', attrs[model_name]['cosine_sim_diff'])
+
+                del model, models_dict, analyzer, baseline_computer
+                gc.collect()
+                try:
+                    torch.cuda.empty_cache()
+                except RuntimeError:
+                    pass
+                print(f"  [Model {mi+1}] done, GPU freed.")
+
+            if all_l2_attrs:
+                model_names = list(all_l2_attrs.keys())
+                save_path = os.path.join(save_dir, f"{label}_attribution.png")
+                visualize_attribution_6row(
+                    save_path, model_names,
+                    fbank_clean, fbank_noise, fbank_noisy,
+                    all_l2_attrs, all_l2_noisy_attrs, all_cos_clean_attrs, all_cos_noisy_attrs,
+                    audio_label=os.path.basename(target_path),
+                    noise_info=noise_info,
+                    baseline_type=args.baseline_type
+                )
+                print(f"[Paired Attribution] Saved: {save_path}")
+
+        print(f"\n[Attribution] All models completed.")
+        return
+
+    # 3.5. Reliability mode: Deletion/Insertion AUC test
+    if args.mode == 'reliability':
+        from attribution.reliability import (
+            batch_deletion_insertion_test,
+            plot_reliability_curves,
+            plot_multi_model_comparison,
+            plot_method_comparison,
+        )
+
+        save_dir = os.path.join(args.save_path, "reliability_test")
+        os.makedirs(save_dir, exist_ok=True)
+        print(f"[Reliability] Saving to: {save_dir}")
+
+        ratios = [float(r) for r in args.del_ins_ratios.split(',')]
+        del_ins_mode = args.del_ins_mode
+
+        all_cosine_results = {}
+        all_l2_results = {}
+
+        for mi, model_path in enumerate(models_paths):
+            if not os.path.exists(model_path):
+                print(f"Error: Model file {model_path} not found. Skipping.")
+                continue
+
+            try:
+                model = ECAPAModel(**vars(args))
+                model.load_parameters(model_path)
+                model.eval()
+            except Exception as e:
+                print(f"Error loading model {model_path}: {e}. Skipping.")
+                continue
+
+            try:
+                path_parts = os.path.normpath(model_path).split(os.sep)
+                epoch_str = os.path.splitext(os.path.basename(model_path))[0].split('_')[-1]
+                dir_name = path_parts[-5] if len(path_parts) >= 5 else (path_parts[-2] if len(path_parts) >= 2 else f"Model_{mi+1}")
+                model_name = f"{dir_name}_{epoch_str}"
+            except Exception:
+                model_name = f"Model_{mi+1}"
+
+            print(f"\n[Reliability] Model {mi+1}/{len(models_paths)}: {model_name}")
+
+            print(f"  Running cosine_sim_diff attribution...")
+            cos_result = batch_deletion_insertion_test(
+                model=model.speaker_encoder,
+                sample_pairs=sample_pairs,
+                attribution_method='cosine_sim_diff',
+                ratios=ratios,
+                mode=del_ins_mode,
+                n_random=args.n_random,
+                n_steps=args.n_steps,
+                device=args.device,
+                eval_path=args.eval_path,
+            )
+            all_cosine_results[model_name] = cos_result
+
+            print(f"  Running l2_norm attribution...")
+            l2_result = batch_deletion_insertion_test(
+                model=model.speaker_encoder,
+                sample_pairs=sample_pairs,
+                attribution_method='l2_norm',
+                ratios=ratios,
+                mode=del_ins_mode,
+                n_random=args.n_random,
+                n_steps=args.n_steps,
+                device=args.device,
+                eval_path=args.eval_path,
+            )
+            all_l2_results[model_name] = l2_result
+
+            plot_reliability_curves(
+                cos_result,
+                save_path=os.path.join(save_dir, f"{model_name}_cosine_sim_reliability.png"),
+                model_name=model_name,
+                attribution_method='cosine_sim_diff',
+                mode=del_ins_mode,
+            )
+            plot_reliability_curves(
+                l2_result,
+                save_path=os.path.join(save_dir, f"{model_name}_l2_norm_reliability.png"),
+                model_name=model_name,
+                attribution_method='l2_norm',
+                mode=del_ins_mode,
+            )
+            plot_method_comparison(
+                cos_result, l2_result,
+                save_path=os.path.join(save_dir, f"{model_name}_method_comparison.png"),
+                model_name=model_name,
+                mode=del_ins_mode,
+            )
+
+            print(f"  Deletion AUC:   cos_sim={cos_result['deletion_auc']:.4f}  l2={l2_result['deletion_auc']:.4f}")
+            print(f"  Insertion AUC:  cos_sim={cos_result['insertion_auc']:.4f}  l2={l2_result['insertion_auc']:.4f}")
+            print(f"  Random Del AUC: cos_sim={cos_result['random_deletion_auc']:.4f}  l2={l2_result['random_deletion_auc']:.4f}")
+
+            del model
+            gc.collect()
+            try:
+                torch.cuda.empty_cache()
+            except RuntimeError:
+                pass
+            print(f"  [Model {mi+1}] done, GPU freed.")
+
+        if len(all_cosine_results) > 1:
+            plot_multi_model_comparison(
+                all_cosine_results,
+                save_path=os.path.join(save_dir, "multi_model_cosine_sim.png"),
+                attribution_method='cosine_sim_diff',
+                mode=del_ins_mode,
+            )
+            plot_multi_model_comparison(
+                all_l2_results,
+                save_path=os.path.join(save_dir, "multi_model_l2_norm.png"),
+                attribution_method='l2_norm',
+                mode=del_ins_mode,
+            )
+
+        print(f"\n[Reliability] All models completed. Results saved to: {save_dir}")
+        return
+
+    # 4. Legacy mode: per-model loop
     for i, model_path in enumerate(models_paths):
         print(f"\n{'='*60}")
         print(f"[Attribution] Model {i+1}/{len(models_paths)}: {model_path}")
@@ -203,7 +476,6 @@ def main():
             print(f"Error loading model {model_path}: {e}. Skipping.")
             continue
 
-        # 提取模型标识符
         try:
             path_parts = os.path.normpath(model_path).split(os.sep)
             epoch_str = os.path.splitext(os.path.basename(model_path))[0].split('_')[-1]
@@ -212,11 +484,7 @@ def main():
         except Exception:
             model_name = f"Model_{i+1}"
 
-        # 单模型字典
         models_dict = {model_name: model.speaker_encoder}
-
-        analyzer = None
-        baseline_computer = None
         save_dir = os.path.join(args.save_path, model_name)
 
         if args.mode == 'legacy':
@@ -230,49 +498,13 @@ def main():
             )
             analyzer.analyze_and_save(samples, save_dir)
 
-        elif args.mode == 'paired':
-            save_dir = os.path.join(args.save_path, f"paired_{model_name}")
-            print(f"[Attribution] Paired mode, saving to: {save_dir}")
-
-            if args.baseline_type != 'zero':
-                baseline_computer = BaselineComputer(
-                    model=model.speaker_encoder,
-                    target_length=200 * 160 + 240,
-                    device=args.device
-                )
-
-            all_audio_paths = glob.glob(os.path.join(args.eval_path, "**/*.wav"), recursive=True)
-            print(f"[Attribution] Found {len(all_audio_paths)} audio files for baseline computation")
-
-            analyzer = ECAPAAttributionAnalyzer(
-                models_dict=models_dict,
-                C=args.C,
-                device=args.device,
-                musan_path=args.musan_path,
-                baseline_computer=baseline_computer
-            )
-            analyzer.analyze_and_save_paired(
-                sample_pairs, save_dir,
-                baseline_type=args.baseline_type,
-                objective=args.objective,
-                base_path=args.eval_path,
-                all_audio_paths=all_audio_paths,
-                add_noise=args.add_noise,
-                snr=args.snr
-            )
-
-        print(f"[Attribution] Model {model_name} done! Saved to {save_dir}")
-
-        del model, models_dict
-        if analyzer is not None:
-            del analyzer
-        if baseline_computer is not None:
-            del baseline_computer
-        gc.collect()
-        try:
-            torch.cuda.empty_cache()
-        except RuntimeError:
-            pass
+            print(f"[Attribution] Model {model_name} done! Saved to {save_dir}")
+            del model, models_dict, analyzer
+            gc.collect()
+            try:
+                torch.cuda.empty_cache()
+            except RuntimeError:
+                pass
         print(f"[Attribution] GPU memory freed.")
 
     print(f"\n[Attribution] All {len(models_paths)} models completed.")
