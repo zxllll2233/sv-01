@@ -615,10 +615,27 @@ def batch_reliability_from_eval_list(
     for t in valid_targets:
         all_ref_files.add(t)
 
-    print(f"[Reliability] Pre-computing {len(all_ref_files)} embeddings...")
+    print(f"[Reliability] Pre-computing {len(all_ref_files)} reference embeddings (full audio)...")
+    import soundfile as sf
     ref_embeddings = {}
     for f in tqdm(sorted(all_ref_files), desc="Reference embeddings"):
         full_path = os.path.join(eval_path, f)
+        try:
+            audio, _ = sf.read(full_path)
+            audio = np.stack([audio], axis=0)
+            audio_tensor = torch.FloatTensor(audio).to(device)
+            with torch.no_grad():
+                emb = model(audio_tensor, aug=False)
+                ref_embeddings[f] = F.normalize(emb, p=2, dim=1).cpu().detach()
+        except Exception as e:
+            print(f"  Warning: failed {f}: {e}")
+
+    # ── 6. Compute target embeddings (300-frame, same path as deletion/insertion) ──
+    target_embeddings = {}
+    for target in valid_targets:
+        if target not in ref_embeddings:
+            continue
+        full_path = os.path.join(eval_path, target)
         try:
             _, audio_tensor = load_audio_as_tensor(full_path, device)
             with torch.no_grad():
@@ -626,16 +643,16 @@ def batch_reliability_from_eval_list(
                 fbank = fbank.log()
                 fbank = fbank - torch.mean(fbank, dim=-1, keepdim=True)
                 emb = F.normalize(_forward_from_fbank(model, fbank), p=2, dim=1)
-                ref_embeddings[f] = emb.cpu().detach()
+                target_embeddings[target] = emb.cpu().detach()
         except Exception as e:
-            print(f"  Warning: failed {f}: {e}")
+            print(f"  Warning: failed {target}: {e}")
 
-    # ── 6. Compute original EER ──
+    # ── 7. Compute original EER ──
     orig_scores, orig_labels = [], []
     for target, trials in target_trials.items():
-        if target not in ref_embeddings:
+        if target not in target_embeddings:
             continue
-        target_emb = ref_embeddings[target].to(device)
+        target_emb = target_embeddings[target].to(device)
         for label, ref_file in trials:
             if ref_file not in ref_embeddings:
                 continue

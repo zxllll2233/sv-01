@@ -145,7 +145,7 @@ def main():
     parser.add_argument('--del_ins_mode', type=str, default='freq_time',
                         choices=['freq_time', 'freq', 'time'],
                         help='Deletion/insertion mode: freq_time (per cell), freq (per frequency bin), time (per time frame)')
-    parser.add_argument('--n_random', type=int, default=2,
+    parser.add_argument('--n_random', type=int, default=5,
                         help='Number of random baseline runs for reliability test')
     parser.add_argument('--n_targets', type=int, default=50,
                         help='Number of target speakers to sample for reliability test (eval_list mode)')
