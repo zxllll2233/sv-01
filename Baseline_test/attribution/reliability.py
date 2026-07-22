@@ -37,7 +37,22 @@ from .integrated_gradients import IntegratedGradients_ECAPA
 #  Core: deletion / insertion on FBank
 # ──────────────────────────────────────────────
 
-def _apply_deletion(fbank_tensor, attribution, ratio, mode='freq_time'):
+def _rank_importance(attribution, axis, sign_mode='abs'):
+    """Per-position importance for ranking, respecting each method's native sign semantics.
+
+    WHY sign_mode: IG-family attributions are signed (magnitude = influence, |a| is
+    the right ranking). ReLU-based CAMs (LayerCAM/Score-CAM) emit positive-only
+    evidence; ranking them by |a| folds in negatives the method explicitly discards,
+    so we rank by ReLU(a). Matching ranking to each method's own convention is the
+    fair setup (avoids the 'you tested abs-of-LayerCAM, not LayerCAM' reviewer attack).
+    """
+    if sign_mode == 'relu':
+        signed = np.maximum(attribution, 0.0)
+        return signed.sum(axis=axis)
+    return np.abs(attribution).sum(axis=axis)
+
+
+def _apply_deletion(fbank_tensor, attribution, ratio, mode='freq_time', sign_mode='abs'):
     """
     Zero out the top-`ratio` fraction of attribution locations in fbank_tensor.
 
@@ -58,28 +73,33 @@ def _apply_deletion(fbank_tensor, attribution, ratio, mode='freq_time'):
     attr_flat = attribution.flatten()
 
     if mode == 'freq_time':
-        threshold = np.percentile(np.abs(attr_flat), (1 - ratio) * 100)
-        mask = np.abs(attribution) >= threshold
+        if sign_mode == 'relu':
+            rank_val = np.maximum(attribution, 0.0)
+        else:
+            rank_val = np.abs(attribution)
+        threshold = np.percentile(rank_val.flatten(), (1 - ratio) * 100)
+        mask = rank_val >= threshold
         modified[0, mask] = 0.0
 
     elif mode == 'freq':
         # attribution per frequency bin: sum over time
-        freq_importance = np.abs(attribution).sum(axis=1)  # [80]
+        freq_importance = _rank_importance(attribution, axis=1, sign_mode=sign_mode)  # [80]
         n_delete = max(1, int(ratio * len(freq_importance)))
-        top_bins = np.argsort(freq_importance)[::-1][:n_delete]
+        # WHY: .copy() — torch index does not accept negative-stride numpy arrays
+        top_bins = np.argsort(freq_importance)[::-1][:n_delete].copy()
         modified[0, top_bins, :] = 0.0
 
     elif mode == 'time':
         # attribution per time frame: sum over freq
-        time_importance = np.abs(attribution).sum(axis=0)  # [T]
+        time_importance = _rank_importance(attribution, axis=0, sign_mode=sign_mode)  # [T]
         n_delete = max(1, int(ratio * len(time_importance)))
-        top_frames = np.argsort(time_importance)[::-1][:n_delete]
+        top_frames = np.argsort(time_importance)[::-1][:n_delete].copy()
         modified[0, :, top_frames] = 0.0
 
     return modified
 
 
-def _apply_insertion(fbank_tensor, attribution, ratio, mode='freq_time'):
+def _apply_insertion(fbank_tensor, attribution, ratio, mode='freq_time', sign_mode='abs', fill='zero'):
     """
     Keep only the top-`ratio` fraction of attribution locations in fbank_tensor,
     zero everything else.
@@ -90,24 +110,34 @@ def _apply_insertion(fbank_tensor, attribution, ratio, mode='freq_time'):
     """
     if attribution.ndim == 3 and attribution.shape[0] == 1:
         attribution = attribution.squeeze(0)
-    modified = torch.zeros_like(fbank_tensor)
-    attr_flat = attribution.flatten()
+    # WHY fill: non-kept frames are set to a baseline. 'zero' is standard; 'mean'
+    # (per-freq mean over time) is the Oracle-Q5 control — if a method's Ins-AUC
+    # collapses under mean-fill but random stays flat, its zero-fill score was a
+    # zero-baseline x ranking-prior artifact rather than genuine sufficiency.
+    if fill == 'mean':
+        modified = fbank_tensor.mean(dim=2, keepdim=True).repeat(1, 1, fbank_tensor.shape[2]).clone()
+    else:
+        modified = torch.zeros_like(fbank_tensor)
 
     if mode == 'freq_time':
-        threshold = np.percentile(np.abs(attr_flat), (1 - ratio) * 100)
-        mask = np.abs(attribution) >= threshold
+        if sign_mode == 'relu':
+            rank_val = np.maximum(attribution, 0.0)
+        else:
+            rank_val = np.abs(attribution)
+        threshold = np.percentile(rank_val.flatten(), (1 - ratio) * 100)
+        mask = rank_val >= threshold
         modified[0, mask] = fbank_tensor[0, mask]
 
     elif mode == 'freq':
-        freq_importance = np.abs(attribution).sum(axis=1)
+        freq_importance = _rank_importance(attribution, axis=1, sign_mode=sign_mode)
         n_keep = max(1, int(ratio * len(freq_importance)))
-        top_bins = np.argsort(freq_importance)[::-1][:n_keep]
+        top_bins = np.argsort(freq_importance)[::-1][:n_keep].copy()
         modified[0, top_bins, :] = fbank_tensor[0, top_bins, :]
 
     elif mode == 'time':
-        time_importance = np.abs(attribution).sum(axis=0)
+        time_importance = _rank_importance(attribution, axis=0, sign_mode=sign_mode)
         n_keep = max(1, int(ratio * len(time_importance)))
-        top_frames = np.argsort(time_importance)[::-1][:n_keep]
+        top_frames = np.argsort(time_importance)[::-1][:n_keep].copy()
         modified[0, :, top_frames] = fbank_tensor[0, :, top_frames]
 
     return modified
@@ -141,11 +171,14 @@ def _apply_random_deletion(fbank_tensor, ratio, rng=None, mode='freq_time'):
     return modified
 
 
-def _apply_random_insertion(fbank_tensor, ratio, rng=None, mode='freq_time'):
+def _apply_random_insertion(fbank_tensor, ratio, rng=None, mode='freq_time', fill='zero'):
     """Same as _apply_insertion but with random ordering (baseline)."""
     if rng is None:
         rng = np.random.default_rng()
-    modified = torch.zeros_like(fbank_tensor)
+    if fill == 'mean':
+        modified = fbank_tensor.mean(dim=2, keepdim=True).repeat(1, 1, fbank_tensor.shape[2]).clone()
+    else:
+        modified = torch.zeros_like(fbank_tensor)
     F, T = fbank_tensor.shape[1], fbank_tensor.shape[2]
 
     if mode == 'freq_time':
@@ -412,6 +445,12 @@ def batch_deletion_insertion_test(
             ig_neg = ig.generate(target_tensor, ref_tensor=ref_diff_tensor,
                                  objective='cosine_sim', verify_convergence=False)
             attribution = ig_pos - ig_neg
+        elif attribution_method == 'fisher_z_diff':
+            ig_pos = ig.generate(target_tensor, ref_tensor=ref_same_tensor,
+                                 objective='fisher_z', verify_convergence=False)
+            ig_neg = ig.generate(target_tensor, ref_tensor=ref_diff_tensor,
+                                 objective='fisher_z', verify_convergence=False)
+            attribution = ig_pos - ig_neg
         elif attribution_method == 'l2_norm':
             attribution = ig.generate(target_tensor, objective='l2_norm', verify_convergence=False)
         else:
@@ -528,6 +567,7 @@ def batch_reliability_from_eval_list(
     n_random: int = 5,
     n_steps: int = 50,
     device: str = 'cuda',
+    methods: List[str] = None,
 ) -> Dict[str, Dict]:
     """
     Full-scale Deletion/Insertion test using VoxCeleb test list for EER computation.
@@ -537,20 +577,25 @@ def batch_reliability_from_eval_list(
     2. Sample n_targets unique target files (one per speaker for diversity)
     3. For each target, find a same-speaker and diff-speaker reference (for IG attribution)
     4. Pre-compute ALL reference embeddings (fast, just forward pass)
-    5. For each attribution method (cosine_sim_diff, l2_norm):
+    5. For each attribution method in `methods`:
        a. Compute IG attribution for each target (slow)
        b. For each ratio, modify target FBank → re-compute embedding → score vs all refs
        c. Compute EER at each ratio
-    6. Return results for both methods
+    6. Return results for all methods
+
+    Args:
+        methods: list of attribution methods to test.
+                 Choices: 'cosine_sim_diff', 'fisher_z_diff', 'l2_norm'.
+                 Default: ['cosine_sim_diff', 'l2_norm'] for backward compat.
 
     Returns:
-        {
-            'cosine_sim_diff': {ratios, eer_curves, deletion_auc, insertion_auc, ...},
-            'l2_norm':         {ratios, eer_curves, deletion_auc, insertion_auc, ...},
-        }
+        {method_name: {ratios, eer_curves, deletion_auc, insertion_auc, ...}, ...}
     """
     if ratios is None:
         ratios = [0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
+
+    if methods is None:
+        methods = ['cosine_sim_diff', 'l2_norm']
 
     model.eval()
     ig = IntegratedGradients_ECAPA(model, n_steps=n_steps)
@@ -681,7 +726,7 @@ def batch_reliability_from_eval_list(
     # ── 8. For each attribution method ──
     method_results = {}
 
-    for method in ['cosine_sim_diff', 'l2_norm']:
+    for method in methods:
         print(f"\n[Reliability] === {method} ===")
 
         # 8a. Compute attribution for each target
@@ -703,9 +748,23 @@ def batch_reliability_from_eval_list(
                                          objective='cosine_sim', verify_convergence=False)
                     target_attributions[target] = ig_pos - ig_neg
                     del ref_same_tensor, ref_diff_tensor
-                else:
+                elif method == 'fisher_z_diff':
+                    ref_same_path = os.path.join(eval_path, target_refs[target]['same'])
+                    ref_diff_path = os.path.join(eval_path, target_refs[target]['diff'])
+                    _, ref_same_tensor = load_audio_as_tensor(ref_same_path, device)
+                    _, ref_diff_tensor = load_audio_as_tensor(ref_diff_path, device)
+
+                    ig_pos = ig.generate(target_tensor, ref_tensor=ref_same_tensor,
+                                         objective='fisher_z', verify_convergence=False)
+                    ig_neg = ig.generate(target_tensor, ref_tensor=ref_diff_tensor,
+                                         objective='fisher_z', verify_convergence=False)
+                    target_attributions[target] = ig_pos - ig_neg
+                    del ref_same_tensor, ref_diff_tensor
+                elif method == 'l2_norm':
                     attr = ig.generate(target_tensor, objective='l2_norm', verify_convergence=False)
                     target_attributions[target] = attr
+                else:
+                    raise ValueError(f"Unknown method: {method}")
 
                 del target_tensor
             except Exception as e:
@@ -1161,3 +1220,45 @@ def plot_combined_reliability(all_method_results: Dict[str, Dict], save_path: st
     plt.tight_layout()
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
     plt.close(fig)
+
+
+# ──────────────────────────────────────────────
+#  JSON export (paper Table data)
+# ──────────────────────────────────────────────
+
+def _to_serializable(obj):
+    import json as _json
+    if isinstance(obj, dict):
+        return {str(k): _to_serializable(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_to_serializable(v) for v in obj]
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    if isinstance(obj, (np.floating, np.integer)):
+        return obj.item()
+    if isinstance(obj, float) and (obj != obj):
+        return None
+    try:
+        _json.dumps(obj)
+        return obj
+    except (TypeError, ValueError):
+        return str(obj)
+
+
+def export_results_json(all_method_results: Dict, save_path: str,
+                        metadata: Optional[Dict] = None):
+    """Dump reliability test results to JSON for downstream table generation.
+
+    Args:
+        all_method_results: {model_name: {method_name: result_dict}}
+        save_path: output .json path
+        metadata: optional dict (e.g. {n_targets, mode, n_steps, model_paths})
+    """
+    import json
+    payload = {
+        'metadata': _to_serializable(metadata or {}),
+        'results': _to_serializable(all_method_results),
+    }
+    with open(save_path, 'w') as f:
+        json.dump(payload, f, indent=2)
+    print(f"[Reliability] JSON exported to {save_path}")

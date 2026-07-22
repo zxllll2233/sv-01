@@ -308,7 +308,8 @@ class ECAPAAttributionAnalyzer:
                                    noisy_tensor=None,
                                    baseline_type='zero',
                                    speaker_audio_paths=None, all_audio_paths=None,
-                                   exclude_speaker_paths=None):
+                                   exclude_speaker_paths=None,
+                                   compute_fisher_z=False):
         results = {}
 
         if baseline_type != 'zero' and self.baseline_computer is not None:
@@ -340,6 +341,13 @@ class ECAPAAttributionAnalyzer:
                 'cosine_sim_diff': cos_diff,
             }
 
+            if compute_fisher_z:
+                fz_pos = ig.generate(target_tensor, ref_tensor=ref_same_tensor,
+                                      baseline=baseline, objective='fisher_z', verify_convergence=True)
+                fz_neg = ig.generate(target_tensor, ref_tensor=ref_diff_tensor,
+                                      baseline=baseline, objective='fisher_z', verify_convergence=True)
+                model_result['fisher_z_diff'] = fz_pos - fz_neg
+
             if noisy_tensor is not None:
                 l2_noisy_map = ig.generate(noisy_tensor, objective='l2_norm', verify_convergence=False)
                 model_result['l2_norm_noisy'] = l2_noisy_map
@@ -349,6 +357,13 @@ class ECAPAAttributionAnalyzer:
                 noisy_neg = ig.generate(noisy_tensor, ref_tensor=ref_diff_tensor,
                                          baseline=baseline, objective='cosine_sim', verify_convergence=True)
                 model_result['cosine_sim_noisy_diff'] = noisy_pos - noisy_neg
+
+                if compute_fisher_z:
+                    fz_noisy_pos = ig.generate(noisy_tensor, ref_tensor=ref_same_tensor,
+                                                baseline=baseline, objective='fisher_z', verify_convergence=True)
+                    fz_noisy_neg = ig.generate(noisy_tensor, ref_tensor=ref_diff_tensor,
+                                                baseline=baseline, objective='fisher_z', verify_convergence=True)
+                    model_result['fisher_z_noisy_diff'] = fz_noisy_pos - fz_noisy_neg
 
             results[name] = model_result
 

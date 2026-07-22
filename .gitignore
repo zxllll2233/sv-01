@@ -1,7 +1,56 @@
+# ==========================
+# OpenCode / IDE / infra
+# ==========================
 .gitnexus
-.claude/
 .gitnexus/
+.claude/
 .idea/
 .joycode
 AGENTS.md
 CLAUDE.md
+
+# ==========================
+# OS / editor junk
+# ==========================
+.DS_Store
+Thumbs.db
+*.swp
+*~
+
+# ==========================
+# Python
+# ==========================
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+.pytest_cache/
+.ipynb_checkpoints/
+
+# ==========================
+# LaTeX build artifacts
+# ==========================
+*.aux
+*.bbl
+*.blg
+*.log
+*.out
+*.toc
+*.synctex.gz
+*.fdb_latexmk
+*.fls
+# ⚠ 保留 refs.bib、main.tex、README.md 等源文件
+
+# ==========================
+# Experiment residuals
+# ==========================
+*.pid
+nohup.out
+
+# ==========================
+# 敏感信息（历史遗留服务器凭证）
+# ==========================
+_archive/docs_old/bash_scripts_with_credentials.txt
+*credentials*
+*password*.txt

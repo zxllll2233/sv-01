@@ -133,7 +133,7 @@ def main():
                         choices=['zero', 'global_mean', 'speaker_mean', 'cross_speaker_mean'],
                         help='Baseline type for IG')
     parser.add_argument('--objective', type=str, default='cosine_sim',
-                        choices=['cosine_sim', 'l2_norm'],
+                        choices=['cosine_sim', 'fisher_z', 'l2_norm'],
                         help='Attribution objective function')
     parser.add_argument('--add_noise', action='store_true',
                         help='Add noisy audio as right-side comparison block')
@@ -150,7 +150,11 @@ def main():
     parser.add_argument('--n_targets', type=int, default=50,
                         help='Number of target speakers to sample for reliability test (eval_list mode)')
     parser.add_argument('--n_steps', type=int, default=50,
-                        help='Number of IG integration steps')
+                        help='Number of IG integration steps (recommend 50 for cosine/l2, 300 for fisher_z)')
+    parser.add_argument('--reliability_methods', type=str, default='cosine_sim_diff,l2_norm',
+                        help='Comma-separated attribution methods for reliability test. Choices: cosine_sim_diff,fisher_z_diff,l2_norm')
+    parser.add_argument('--json_export', type=str, default=None,
+                        help='Path to export reliability results as JSON (auto-generated if not set)')
 
     args = parser.parse_args()
 
@@ -351,6 +355,7 @@ def main():
             batch_deletion_insertion_test,
             batch_reliability_from_eval_list,
             plot_combined_reliability,
+            export_results_json,
         )
 
         paper_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'paper', 'result')
@@ -360,6 +365,9 @@ def main():
 
         ratios = [float(r) for r in args.del_ins_ratios.split(',')]
         del_ins_mode = args.del_ins_mode
+        methods = [m.strip() for m in args.reliability_methods.split(',') if m.strip()]
+        print(f"[Reliability] Methods: {methods}")
+        print(f"[Reliability] n_steps={args.n_steps}, mode={del_ins_mode}, n_targets={args.n_targets}")
 
         use_eval_list = args.paired_list is None or not os.path.exists(args.paired_list)
         all_method_results = {}
@@ -398,41 +406,44 @@ def main():
                     n_random=args.n_random,
                     n_steps=args.n_steps,
                     device=args.device,
+                    methods=methods,
                 )
             else:
-                cos_result = batch_deletion_insertion_test(
-                    model=model.speaker_encoder,
-                    sample_pairs=sample_pairs,
-                    attribution_method='cosine_sim_diff',
-                    ratios=ratios,
-                    mode=del_ins_mode,
-                    n_random=args.n_random,
-                    n_steps=args.n_steps,
-                    device=args.device,
-                    eval_path=args.eval_path,
-                )
-                l2_result = batch_deletion_insertion_test(
-                    model=model.speaker_encoder,
-                    sample_pairs=sample_pairs,
-                    attribution_method='l2_norm',
-                    ratios=ratios,
-                    mode=del_ins_mode,
-                    n_random=args.n_random,
-                    n_steps=args.n_steps,
-                    device=args.device,
-                    eval_path=args.eval_path,
-                )
-                method_results = {
-                    'cosine_sim_diff': cos_result,
-                    'l2_norm': l2_result,
-                }
+                method_results = {}
+                for method in methods:
+                    method_results[method] = batch_deletion_insertion_test(
+                        model=model.speaker_encoder,
+                        sample_pairs=sample_pairs,
+                        attribution_method=method,
+                        ratios=ratios,
+                        mode=del_ins_mode,
+                        n_random=args.n_random,
+                        n_steps=args.n_steps,
+                        device=args.device,
+                        eval_path=args.eval_path,
+                    )
 
             all_method_results[model_name] = method_results
 
-            cos_r = method_results['cosine_sim_diff']
-            l2_r = method_results['l2_norm']
-            print(f"  Deletion AUC:   cos_sim={cos_r['deletion_auc']:.4f}  l2={l2_r['deletion_auc']:.4f}")
-            print(f"  Insertion AUC:  cos_sim={cos_r['insertion_auc']:.4f}  l2={l2_r['insertion_auc']:.4f}")
+            for method, mr in method_results.items():
+                print(f"  [{method}]  Deletion AUC={mr['deletion_auc']:.4f} (rand={mr['random_deletion_auc']:.4f})  "
+                      f"Insertion AUC={mr['insertion_auc']:.4f} (rand={mr['random_insertion_auc']:.4f})")
+
+            # Export per-model JSON immediately (in case later model crashes)
+            per_model_json = os.path.join(save_dir, f"{model_name}_{del_ins_mode}.json")
+            export_results_json(
+                {model_name: method_results},
+                save_path=per_model_json,
+                metadata={
+                    'mode': del_ins_mode,
+                    'n_steps': args.n_steps,
+                    'n_targets': args.n_targets,
+                    'methods': methods,
+                    'ratios': ratios,
+                    'model_path': model_path,
+                    'paired_list': args.paired_list,
+                },
+            )
 
             del model
             gc.collect()
@@ -442,11 +453,34 @@ def main():
                 pass
             print(f"  [Model {mi+1}] done, GPU freed.")
 
-        plot_combined_reliability(
-            all_method_results,
-            save_path=os.path.join(save_dir, "reliability_combined.png"),
-            mode=del_ins_mode,
+        # Combined JSON across all models
+        combined_json = args.json_export or os.path.join(
+            save_dir, f"reliability_all_models_{del_ins_mode}.json"
         )
+        export_results_json(
+            all_method_results,
+            save_path=combined_json,
+            metadata={
+                'mode': del_ins_mode,
+                'n_steps': args.n_steps,
+                'n_targets': args.n_targets,
+                'methods': methods,
+                'ratios': ratios,
+                'model_paths': models_paths,
+                'paired_list': args.paired_list,
+            },
+        )
+
+        # Combined plot (only when both 'cosine_sim_diff' and 'l2_norm' are present,
+        # since plot_combined_reliability hardcodes these two keys)
+        if all('cosine_sim_diff' in mr and 'l2_norm' in mr for mr in all_method_results.values()):
+            plot_combined_reliability(
+                all_method_results,
+                save_path=os.path.join(save_dir, f"reliability_combined_{del_ins_mode}.png"),
+                mode=del_ins_mode,
+            )
+        else:
+            print("[Reliability] Skipping combined plot (requires both cosine_sim_diff + l2_norm)")
 
         print(f"\n[Reliability] All models completed. Results saved to: {save_dir}")
         return
